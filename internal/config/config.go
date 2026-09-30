@@ -66,6 +66,9 @@ type Sandbox struct {
 	PidsMax      int           `yaml:"pids_max"`
 	Defaults     Limits        `yaml:"defaults"`
 	Max          Limits        `yaml:"max"`
+	// DiskMiBPerSecond and DiskIOPS limit each drive of every sandbox.
+	DiskMiBPerSecond int `yaml:"disk_mib_per_second"`
+	DiskIOPS         int `yaml:"disk_iops"`
 	// Pools are warm pools of started sandboxes, one per image and shape.
 	Pools []Pool `yaml:"pools"`
 	// PoolMaxAge recycles pooled sandboxes older than this.
@@ -175,6 +178,8 @@ func (c *Config) applyDefaults() {
 	setDefault(&c.Sandbox.Max.IdleTimeout, 2*time.Hour)
 	setDefault(&c.Sandbox.Max.ExecTimeout, time.Hour)
 	setDefault(&c.Sandbox.PoolMaxAge, 30*time.Minute)
+	setDefault(&c.Sandbox.DiskMiBPerSecond, 256)
+	setDefault(&c.Sandbox.DiskIOPS, 10000)
 	for i := range c.Sandbox.Pools {
 		p := &c.Sandbox.Pools[i]
 		setDefault(&p.Image, c.Sandbox.Image)
@@ -226,6 +231,7 @@ func (c *Config) Validate() error {
 	}
 	check(pooled <= c.Sandbox.MaxSandboxes, "sandbox.pools: sizes add up to %d, more than max_sandboxes %d", pooled, c.Sandbox.MaxSandboxes)
 	check(c.Sandbox.PoolMaxAge > 0, "sandbox.pool_max_age must be positive")
+	check(c.Sandbox.DiskMiBPerSecond > 0 && c.Sandbox.DiskIOPS > 0, "sandbox.disk_mib_per_second and sandbox.disk_iops must be positive")
 	d, m := c.Sandbox.Defaults, c.Sandbox.Max
 	check(d.VCPUs <= m.VCPUs && d.MemoryMiB <= m.MemoryMiB && d.Lifetime <= m.Lifetime &&
 		d.IdleTimeout <= m.IdleTimeout && d.ExecTimeout <= m.ExecTimeout,

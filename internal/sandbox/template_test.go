@@ -27,6 +27,7 @@ func TestManifestMismatchNamesTheField(t *testing.T) {
 		"kernel_args":              func(m *Manifest) { m.KernelArgs = "console=ttyS0 quiet" },
 		"network_bytes_per_second": func(m *Manifest) { m.NetworkBytesPerSecond = 1 },
 		"memory_mib":               func(m *Manifest) { m.MemoryMiB = 512 },
+		"disk_ops_per_second":      func(m *Manifest) { m.DiskOpsPerSecond = 1 },
 	} {
 		got := want
 		change(&got)

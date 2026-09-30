@@ -59,6 +59,10 @@ type FirecrackerConfig struct {
 	// NetworkBytesPerSecond limits each direction of a sandbox's network
 	// device (Firecracker's rx and tx rate limiters).
 	NetworkBytesPerSecond int64
+	// DiskBytesPerSecond and DiskOpsPerSecond limit each of a sandbox's
+	// drives (Firecracker's block rate limiter).
+	DiskBytesPerSecond int64
+	DiskOpsPerSecond   int64
 }
 
 // DefaultBootArgs start the guest agent as init. The kernel adds the root
@@ -257,9 +261,13 @@ func (b *FirecrackerBooter) configure(ctx context.Context, api *vmm.Client, limi
 			})
 		},
 		func() error {
-			return api.PutDrive(ctx, vmm.Drive{DriveID: "rootfs", PathOnHost: jailRootfs, IsRootDevice: true, IsReadOnly: true})
+			return api.PutDrive(ctx, vmm.Drive{
+				DriveID: "rootfs", PathOnHost: jailRootfs, IsRootDevice: true, IsReadOnly: true, RateLimiter: b.diskLimiter(),
+			})
 		},
-		func() error { return api.PutDrive(ctx, vmm.Drive{DriveID: "scratch", PathOnHost: jailScratch}) },
+		func() error {
+			return api.PutDrive(ctx, vmm.Drive{DriveID: "scratch", PathOnHost: jailScratch, RateLimiter: b.diskLimiter()})
+		},
 		func() error { return api.PutVsock(ctx, vmm.Vsock{GuestCID: guestCID, UDSPath: jailVsock}) },
 		func() error { return api.PutSerial(ctx, b.serial()) },
 		func() error {
@@ -275,6 +283,14 @@ func (b *FirecrackerBooter) configure(ctx context.Context, api *vmm.Client, limi
 		}
 	}
 	return nil
+}
+
+// diskLimiter returns a fresh block rate limiter; each drive gets its own.
+func (b *FirecrackerBooter) diskLimiter() *vmm.RateLimiter {
+	return &vmm.RateLimiter{
+		Bandwidth: &vmm.TokenBucket{Size: b.cfg.DiskBytesPerSecond, RefillTimeMS: 1000},
+		Ops:       &vmm.TokenBucket{Size: b.cfg.DiskOpsPerSecond, RefillTimeMS: 1000},
+	}
 }
 
 func (b *FirecrackerBooter) kernelArgs() string {

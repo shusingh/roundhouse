@@ -38,6 +38,8 @@ type Manifest struct {
 	RootfsSHA256          string `json:"rootfs_sha256"`
 	KernelArgs            string `json:"kernel_args"`
 	NetworkBytesPerSecond int64  `json:"network_bytes_per_second"`
+	DiskBytesPerSecond    int64  `json:"disk_bytes_per_second"`
+	DiskOpsPerSecond      int64  `json:"disk_ops_per_second"`
 	// CreatedAt is informational and not compared.
 	CreatedAt time.Time `json:"created_at"`
 }
@@ -62,6 +64,8 @@ func (m Manifest) mismatch(want Manifest) string {
 		{"rootfs_sha256", m.RootfsSHA256, want.RootfsSHA256},
 		{"kernel_args", m.KernelArgs, want.KernelArgs},
 		{"network_bytes_per_second", m.NetworkBytesPerSecond, want.NetworkBytesPerSecond},
+		{"disk_bytes_per_second", m.DiskBytesPerSecond, want.DiskBytesPerSecond},
+		{"disk_ops_per_second", m.DiskOpsPerSecond, want.DiskOpsPerSecond},
 	}
 	for _, f := range fields {
 		if f.got != f.need {
@@ -108,6 +112,8 @@ func (h *hostFacts) manifest(img storage.Image, limits Limits) (Manifest, error)
 		KernelSHA256: kernel, RootfsSHA256: rootfs,
 		KernelArgs:            h.booter.kernelArgs(),
 		NetworkBytesPerSecond: h.booter.cfg.NetworkBytesPerSecond,
+		DiskBytesPerSecond:    h.booter.cfg.DiskBytesPerSecond,
+		DiskOpsPerSecond:      h.booter.cfg.DiskOpsPerSecond,
 	}, nil
 }
 

@@ -62,6 +62,8 @@ func New(cfg config.Config, logger *slog.Logger) (*Node, error) {
 		ConsoleBytesPerSecond: 16 << 10,
 		Network:               network,
 		NetworkBytesPerSecond: int64(cfg.Network.BandwidthMbps) * 1_000_000 / 8,
+		DiskBytesPerSecond:    int64(cfg.Sandbox.DiskMiBPerSecond) << 20,
+		DiskOpsPerSecond:      int64(cfg.Sandbox.DiskIOPS),
 	}, logger)
 	pools := make([]sandbox.PoolConfig, len(cfg.Sandbox.Pools))
 	for i, p := range cfg.Sandbox.Pools {
