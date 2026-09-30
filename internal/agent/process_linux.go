@@ -1,0 +1,43 @@
+package agent
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"syscall"
+
+	"golang.org/x/sys/unix"
+)
+
+// configureProcessGroup puts the command in its own process group and makes
+// cancellation (time limit or host hang-up) kill the whole group, so children
+// the command started do not outlive it.
+func configureProcessGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		// With Setpgid the group ID equals the leader's PID.
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+}
+
+// rndReseedCRNG is the RNDRESEEDCRNG ioctl, _IO('R', 0x07): it makes the
+// kernel reseed its random number generator from the input pool immediately.
+const rndReseedCRNG = 0x5207
+
+// reseedKernel mixes host-supplied entropy into the guest kernel's input pool
+// and forces an immediate reseed, so clones restored from one snapshot stop
+// sharing random output right away (docs/engineering/design.md section 7.3).
+func reseedKernel(entropy []byte) error {
+	f, err := os.OpenFile("/dev/urandom", os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open /dev/urandom: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.Write(entropy); err != nil {
+		return fmt.Errorf("mix entropy: %w", err)
+	}
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), rndReseedCRNG, 0); errno != 0 {
+		return fmt.Errorf("force reseed: %w", errno)
+	}
+	return nil
+}
