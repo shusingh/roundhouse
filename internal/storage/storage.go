@@ -5,6 +5,7 @@
 // hard link images instead of copying them (docs/adr/0006-storage.md):
 //
 //	<root>/images/<name>/{vmlinux,rootfs.ext4,scratch.ext4}
+//	<root>/images/<name>/templates/<vcpus>cpu-<mib>mib/{manifest.json,vm.state,vm.mem,scratch.ext4}
 //	<root>/sandboxes/<id>/scratch.ext4
 //	<root>/jail/firecracker/rh-<id>/root/...
 package storage
@@ -71,10 +72,51 @@ func (l Layout) OpenImage(name string) (Image, error) {
 	return img, nil
 }
 
+// Template is a snapshot of a booted guest, taken from one image at one VM
+// shape. The scratch disk is the booted guest's disk at snapshot time: the
+// snapshot's page cache describes that disk, not the image's pristine one.
+type Template struct {
+	Dir      string
+	Manifest string
+	State    string
+	Memory   string
+	Scratch  string
+}
+
+// TemplateDir is where the template of image at a VM shape lives.
+func (l Layout) TemplateDir(image string, vcpus, memoryMiB int) string {
+	return filepath.Join(l.ImageDir(image), "templates", fmt.Sprintf("%dcpu-%dmib", vcpus, memoryMiB))
+}
+
+// TemplateAt returns the paths of a template's files in dir.
+func TemplateAt(dir string) Template {
+	return Template{
+		Dir:      dir,
+		Manifest: filepath.Join(dir, "manifest.json"),
+		State:    filepath.Join(dir, "vm.state"),
+		Memory:   filepath.Join(dir, "vm.mem"),
+		Scratch:  filepath.Join(dir, "scratch.ext4"),
+	}
+}
+
+// TemplateDirs lists every template directory holding a manifest, across
+// images.
+func (l Layout) TemplateDirs() ([]string, error) {
+	manifests, err := filepath.Glob(filepath.Join(l.Root, "images", "*", "templates", "*", "manifest.json"))
+	if err != nil {
+		return nil, fmt.Errorf("list templates: %w", err)
+	}
+	dirs := make([]string, len(manifests))
+	for i, m := range manifests {
+		dirs[i] = filepath.Dir(m)
+	}
+	return dirs, nil
+}
+
 // CreateSandboxDir creates a sandbox's directory and a private copy of the
-// image's scratch disk in it, owned by uid and gid and writable only by them.
-// It returns the scratch disk's path.
-func (l Layout) CreateSandboxDir(id string, img Image, uid, gid int) (string, error) {
+// scratch disk at source (an image's or a template's) in it, owned by uid
+// and gid and writable only by them. It returns the copy's path.
+func (l Layout) CreateSandboxDir(id, source string, uid, gid int) (string, error) {
 	if !validName.MatchString(id) {
 		return "", fmt.Errorf("sandbox id %q: want lowercase letters, digits, and hyphens", id)
 	}
@@ -86,7 +128,7 @@ func (l Layout) CreateSandboxDir(id string, img Image, uid, gid int) (string, er
 		return "", fmt.Errorf("create sandbox directory: %w", err)
 	}
 	scratch := filepath.Join(dir, "scratch.ext4")
-	if err := SparseCopy(scratch, img.Scratch, 0o600); err != nil {
+	if err := SparseCopy(scratch, source, 0o600); err != nil {
 		return "", errors.Join(fmt.Errorf("copy scratch disk: %w", err), os.RemoveAll(dir))
 	}
 	if err := os.Chown(scratch, uid, gid); err != nil {

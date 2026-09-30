@@ -5,6 +5,8 @@
 //
 //	roundhoused -config /etc/roundhouse/roundhoused.yaml
 //	roundhoused hash-key            generate an API key and its config digest
+//	roundhoused template build -config FILE [-image NAME] [-vcpus N] [-memory-mib N]
+//	                                snapshot a booted guest as a template
 package main
 
 import (
@@ -27,6 +29,7 @@ import (
 	"github.com/shusingh/roundhouse/internal/api"
 	"github.com/shusingh/roundhouse/internal/config"
 	"github.com/shusingh/roundhouse/internal/node"
+	"github.com/shusingh/roundhouse/internal/sandbox"
 	"github.com/shusingh/roundhouse/internal/telemetry"
 )
 
@@ -35,7 +38,13 @@ func main() {
 		hashKey()
 		return
 	}
-	if err := run(); err != nil {
+	var err error
+	if len(os.Args) >= 3 && os.Args[1] == "template" && os.Args[2] == "build" {
+		err = buildTemplate(os.Args[3:])
+	} else {
+		err = run()
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "roundhoused:", err)
 		os.Exit(1)
 	}
@@ -66,10 +75,11 @@ func run() error {
 		return errors.New("must run as root: it launches jailed VMMs and manages cgroups and namespaces")
 	}
 
-	manager, err := node.New(cfg, logger)
+	n, err := node.New(cfg, logger)
 	if err != nil {
 		return err
 	}
+	manager := n.Manager
 	apiServer, err := api.New(cfg, manager, logger)
 	if err != nil {
 		return err
@@ -78,9 +88,9 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 
-	// Reconcile before listening: it removes every Roundhouse resource on the
+	// Prepare before listening: it removes every Roundhouse resource on the
 	// host, so it must not overlap any request.
-	if err := manager.Reconcile(ctx); err != nil {
+	if err := manager.Prepare(ctx); err != nil {
 		return err
 	}
 	managerErr := make(chan error, 1)
@@ -128,4 +138,52 @@ func run() error {
 	}
 	logger.Info("roundhoused stopped")
 	return runErr
+}
+
+// buildTemplate boots a guest and saves it as the template for its image and
+// shape. Run it while roundhoused is stopped, or restart roundhoused after:
+// templates are loaded at startup.
+func buildTemplate(args []string) error {
+	fs := flag.NewFlagSet("template build", flag.ContinueOnError)
+	configPath := fs.String("config", "/etc/roundhouse/roundhoused.yaml", "configuration file")
+	image := fs.String("image", "", "image name (default: sandbox.image)")
+	vcpus := fs.Int("vcpus", 0, "vCPUs (default: sandbox.defaults.vcpus)")
+	memory := fs.Int("memory-mib", 0, "guest memory in MiB (default: sandbox.defaults.memory_mib)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	if os.Geteuid() != 0 {
+		return errors.New("must run as root: it launches a jailed VMM")
+	}
+	logger, err := telemetry.NewLogger(os.Stderr, cfg.LogLevel)
+	if err != nil {
+		return err
+	}
+	if *image == "" {
+		*image = cfg.Sandbox.Image
+	}
+	if *vcpus == 0 {
+		*vcpus = cfg.Sandbox.Defaults.VCPUs
+	}
+	if *memory == 0 {
+		*memory = cfg.Sandbox.Defaults.MemoryMiB
+	}
+	n, err := node.New(cfg, logger)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	start := time.Now()
+	m, err := n.Booter.BuildTemplate(ctx, *image, sandbox.Limits{VCPUs: *vcpus, MemoryMiB: *memory}, n.TemplateUID)
+	if err != nil {
+		return fmt.Errorf("build template: %w", err)
+	}
+	fmt.Printf("template %s %dcpu-%dmib built in %v (Firecracker %s, kernel %.12s, rootfs %.12s)\n",
+		m.Image, m.VCPUs, m.MemoryMiB, time.Since(start).Round(time.Millisecond), m.FirecrackerVersion, m.KernelSHA256, m.RootfsSHA256)
+	return nil
 }

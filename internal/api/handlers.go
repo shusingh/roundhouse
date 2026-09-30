@@ -61,6 +61,7 @@ type sandboxView struct {
 	ExpiresAt          time.Time `json:"expires_at"`
 	IdleTimeoutSeconds int64     `json:"idle_timeout_seconds"`
 	Egress             string    `json:"egress"`
+	StartPath          string    `json:"start_path"`
 	ActiveCalls        int       `json:"active_calls"`
 }
 
@@ -69,7 +70,7 @@ func view(i sandbox.Info) sandboxView {
 		ID: i.ID, Image: i.Image, State: string(i.State), VCPUs: i.Limits.VCPUs, MemoryMiB: i.Limits.MemoryMiB,
 		CreatedAt: i.CreatedAt.UTC(), ExpiresAt: i.ExpiresAt.UTC(),
 		IdleTimeoutSeconds: int64(i.Limits.IdleTimeout / time.Second), Egress: string(i.Egress.Mode),
-		ActiveCalls: i.ActiveCalls,
+		StartPath: string(i.StartPath), ActiveCalls: i.ActiveCalls,
 	}
 }
 
@@ -137,9 +138,11 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if image == "" {
 		image = s.cfg.Image
 	}
-	info, err := s.sandboxes.Create(r.Context(), sandbox.CreateRequest{Owner: owner(r), Image: image, Limits: limits, Egress: egress})
+	info, err := s.sandboxes.Create(r.Context(), sandbox.CreateRequest{
+		Owner: owner(r), Quota: quota(r), Image: image, Limits: limits, Egress: egress,
+	})
 	switch {
-	case errors.Is(err, sandbox.ErrCapacity):
+	case errors.Is(err, sandbox.ErrCapacity), errors.Is(err, sandbox.ErrQuota):
 		s.writeSandboxError(w, r, err)
 	case err != nil:
 		s.logger.Error("create sandbox", slog.String("error", err.Error()))

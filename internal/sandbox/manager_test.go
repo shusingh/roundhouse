@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shusingh/roundhouse/internal/admission"
 	"github.com/shusingh/roundhouse/internal/agentproto"
 	"github.com/shusingh/roundhouse/internal/netns"
 )
@@ -40,6 +41,8 @@ type fakeVM struct {
 	execStarted   chan struct{}
 	execRelease   chan struct{}
 	lastExecInput agentproto.ExecRequest
+	claimErr      error
+	claimed       atomic.Pointer[netns.Egress]
 }
 
 func (v *fakeVM) Exec(ctx context.Context, req agentproto.ExecRequest, _ func(*agentproto.Frame) error) (*agentproto.Frame, error) {
@@ -58,6 +61,12 @@ func (v *fakeVM) Exec(ctx context.Context, req agentproto.ExecRequest, _ func(*a
 func (v *fakeVM) WriteFile(context.Context, string, io.Reader) error         { return nil }
 func (v *fakeVM) ReadFile(context.Context, string, io.Writer) (int64, error) { return 0, nil }
 func (v *fakeVM) Exited() (bool, error)                                      { return v.exited.Load(), nil }
+func (v *fakeVM) StartPath() StartPath                                       { return StartRestore }
+
+func (v *fakeVM) Claim(_ context.Context, egress netns.Egress) error {
+	v.claimed.Store(&egress)
+	return v.claimErr
+}
 
 func (v *fakeVM) Destroy(context.Context) error {
 	if v.failDestroyN.Load() > 0 {
@@ -69,10 +78,11 @@ func (v *fakeVM) Destroy(context.Context) error {
 }
 
 type fakeBooter struct {
-	mu        sync.Mutex
-	vms       map[string]*fakeVM
-	failBoot  bool
-	reconcile error
+	mu       sync.Mutex
+	vms      map[string]*fakeVM
+	failBoot bool
+	claimErr error // given to every VM booted
+	prepare  error
 }
 
 func (b *fakeBooter) Boot(_ context.Context, spec BootSpec) (VM, error) {
@@ -81,12 +91,12 @@ func (b *fakeBooter) Boot(_ context.Context, spec BootSpec) (VM, error) {
 	if b.failBoot {
 		return nil, errors.New("simulated boot failure")
 	}
-	vm := &fakeVM{spec: spec}
+	vm := &fakeVM{spec: spec, claimErr: b.claimErr}
 	b.vms[spec.ID] = vm
 	return vm, nil
 }
 
-func (b *fakeBooter) Reconcile(context.Context) error { return b.reconcile }
+func (b *fakeBooter) Prepare(context.Context) error { return b.prepare }
 
 func (b *fakeBooter) vm(id string) *fakeVM {
 	b.mu.Lock()
@@ -94,11 +104,15 @@ func (b *fakeBooter) vm(id string) *fakeVM {
 	return b.vms[id]
 }
 
-func newTestManager(t *testing.T, max int) (*Manager, *fakeBooter, *fakeClock) {
+func newTestManager(t *testing.T, max int, options ...func(*Config)) (*Manager, *fakeBooter, *fakeClock) {
 	t.Helper()
 	clock := &fakeClock{now: time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)}
 	booter := &fakeBooter{vms: map[string]*fakeVM{}}
-	m := NewManager(Config{MaxSandboxes: max, UIDBase: 200_000, Now: clock.Now}, booter, slog.New(slog.DiscardHandler))
+	cfg := Config{MaxSandboxes: max, UIDBase: 200_000, Now: clock.Now}
+	for _, o := range options {
+		o(&cfg)
+	}
+	m := NewManager(cfg, booter, slog.New(slog.DiscardHandler))
 	var n atomic.Int32
 	m.newID = func() string { return fmt.Sprintf("sb-%d", n.Add(1)) }
 	return m, booter, clock
@@ -308,11 +322,220 @@ func TestConcurrentCreatesRespectCapacity(t *testing.T) {
 	}
 }
 
-func TestReconcileReportsFailure(t *testing.T) {
+func TestPrepareReportsFailure(t *testing.T) {
 	t.Parallel()
 	m, booter, _ := newTestManager(t, 1)
-	booter.reconcile = errors.New("cannot list jails")
-	if err := m.Reconcile(context.Background()); err == nil {
-		t.Fatal("Reconcile hid a booter failure")
+	booter.prepare = errors.New("cannot list jails")
+	if err := m.Prepare(context.Background()); err == nil {
+		t.Fatal("Prepare hid a booter failure")
+	}
+}
+
+func withPool(size int) func(*Config) {
+	return func(c *Config) {
+		c.Pools = []PoolConfig{{Image: "default", VCPUs: testLimits.VCPUs, MemoryMiB: testLimits.MemoryMiB, Size: size}}
+		c.PoolMaxAge = 10 * time.Minute
+	}
+}
+
+// fill runs one refill pass and waits for its starts.
+func fill(m *Manager) {
+	m.fillPools(context.Background())
+	m.starts.Wait()
+}
+
+func idle(m *Manager) int {
+	n := 0
+	for _, p := range m.Pools() {
+		n += p.Idle
+	}
+	return n
+}
+
+func (b *fakeBooter) ids() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ids := make([]string, 0, len(b.vms))
+	for id := range b.vms {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func TestPoolServesMatchingCreatesAndRefills(t *testing.T) {
+	t.Parallel()
+	m, booter, _ := newTestManager(t, 8, withPool(2))
+	fill(m)
+	if n := idle(m); n != 2 {
+		t.Fatalf("pool holds %d sandboxes, want 2", n)
+	}
+	if list := m.List(""); len(list) != 0 {
+		t.Errorf("pooled sandboxes are visible to an empty owner: %+v", list)
+	}
+
+	internet := netns.Egress{Mode: netns.ModeInternet}
+	info, err := m.Create(context.Background(), CreateRequest{Owner: "a", Image: "default", Limits: testLimits, Egress: internet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.StartPath != StartPool || info.State != StateReady || info.Owner != "a" || info.Egress.Mode != netns.ModeInternet {
+		t.Errorf("claimed sandbox = %+v, want a ready pool start owned by a with internet egress", info)
+	}
+	if got := booter.vm(info.ID).claimed.Load(); got == nil || got.Mode != netns.ModeInternet {
+		t.Errorf("claim applied egress %v, want internet", got)
+	}
+	if info.ExpiresAt.Sub(m.cfg.Now()) != testLimits.Lifetime {
+		t.Errorf("a claimed sandbox's lifetime ends %v, want one lifetime after the claim", info.ExpiresAt)
+	}
+	if n := idle(m); n != 1 {
+		t.Fatalf("pool holds %d after a claim, want 1", n)
+	}
+	fill(m)
+	if n := idle(m); n != 2 {
+		t.Errorf("pool holds %d after a refill, want 2", n)
+	}
+
+	// Another shape is not served from the pool.
+	other := testLimits
+	other.MemoryMiB = 512
+	info, err = m.Create(context.Background(), CreateRequest{Owner: "a", Image: "default", Limits: other, Egress: none})
+	if err != nil || info.StartPath != StartRestore {
+		t.Errorf("create of another shape = %+v, %v; want a fresh start", info, err)
+	}
+}
+
+func TestFailedClaimFallsBackToAFreshStart(t *testing.T) {
+	t.Parallel()
+	m, booter, _ := newTestManager(t, 4, withPool(1))
+	booter.claimErr = errors.New("agent did not answer")
+	fill(m)
+	pooledID := booter.ids()[0]
+	booter.claimErr = nil
+	info, err := m.Create(context.Background(), CreateRequest{Owner: "a", Image: "default", Limits: testLimits, Egress: none})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ID == pooledID || info.StartPath == StartPool {
+		t.Errorf("create returned the sandbox that failed its claim: %+v", info)
+	}
+	if booter.vm(pooledID).destroyed.Load() != 1 {
+		t.Error("the sandbox that failed its claim was not destroyed")
+	}
+}
+
+func TestCreateEvictsPooledSandboxesWhenTheHostIsFull(t *testing.T) {
+	t.Parallel()
+	m, _, _ := newTestManager(t, 2, withPool(2))
+	fill(m)
+	other := testLimits
+	other.MemoryMiB = 512 // not the pool's shape, so it cannot claim
+	for i := range 2 {
+		if _, err := m.Create(context.Background(), CreateRequest{Owner: "a", Image: "default", Limits: other, Egress: none}); err != nil {
+			t.Fatalf("create %d on a host full of pooled sandboxes: %v", i, err)
+		}
+	}
+	fill(m)
+	if n := idle(m); n != 0 {
+		t.Errorf("pool refilled to %d on a full host, want 0", n)
+	}
+	if _, err := m.Create(context.Background(), CreateRequest{Owner: "a", Image: "default", Limits: other, Egress: none}); !errors.Is(err, ErrCapacity) {
+		t.Errorf("create on a host full of callers' sandboxes = %v, want ErrCapacity", err)
+	}
+}
+
+func TestAdmissionBudgetBoundsMemory(t *testing.T) {
+	t.Parallel()
+	budget, err := admission.New(admission.Budget{MemoryMiB: 700, VCPUs: 64, Sandboxes: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, _, _ := newTestManager(t, 64, func(c *Config) {
+		c.Admission = budget
+		c.VMMOverheadMiB = 64
+	})
+	create(t, m, "a")
+	create(t, m, "a") // 2 x (256 + 64) = 640 MiB
+	_, err = m.Create(context.Background(), CreateRequest{Owner: "a", Image: "default", Limits: testLimits, Egress: none})
+	if !errors.Is(err, ErrCapacity) || !errors.Is(err, admission.ErrOverBudget) {
+		t.Fatalf("create past the memory budget = %v, want ErrCapacity from the budget", err)
+	}
+	if got := budget.InUse(); got.MemoryMiB != 640 || got.Sandboxes != 2 {
+		t.Errorf("budget in use = %+v, want 640 MiB and 2 sandboxes", got)
+	}
+}
+
+func TestPooledSandboxesAreRecycledAndShutDown(t *testing.T) {
+	t.Parallel()
+	m, booter, clock := newTestManager(t, 4, withPool(1))
+	ctx := context.Background()
+	fill(m)
+	first := booter.vm(booter.ids()[0])
+	clock.Advance(11 * time.Minute)
+	m.Reap(ctx)
+	if first.destroyed.Load() != 1 {
+		t.Fatal("a pooled sandbox past the age limit was not recycled")
+	}
+	fill(m)
+	if n := idle(m); n != 1 {
+		t.Fatalf("pool holds %d after recycling, want 1", n)
+	}
+	if err := m.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range booter.ids() {
+		if booter.vm(id).destroyed.Load() != 1 {
+			t.Errorf("Shutdown left pooled sandbox %s", id)
+		}
+	}
+}
+
+func TestPoolBacksOffAfterAFailedStart(t *testing.T) {
+	t.Parallel()
+	m, booter, clock := newTestManager(t, 4, withPool(1))
+	booter.failBoot = true
+	fill(m)
+	booter.failBoot = false
+	fill(m)
+	if n := idle(m); n != 0 {
+		t.Fatal("pool retried immediately after a failed start")
+	}
+	clock.Advance(poolRetryDelay)
+	fill(m)
+	if n := idle(m); n != 1 {
+		t.Errorf("pool holds %d after the retry delay, want 1", n)
+	}
+}
+
+func TestQuotaCapsEachOwner(t *testing.T) {
+	t.Parallel()
+	m, _, _ := newTestManager(t, 8, withPool(2))
+	fill(m)
+	ctx := context.Background()
+	req := CreateRequest{Owner: "a", Image: "default", Limits: testLimits, Egress: none, Quota: 2}
+	var first Info
+	for i := range 2 {
+		info, err := m.Create(ctx, req)
+		if err != nil {
+			t.Fatalf("create %d within quota: %v", i, err)
+		}
+		first = info
+	}
+	if _, err := m.Create(ctx, req); !errors.Is(err, ErrQuota) {
+		t.Fatalf("create over quota from the pool = %v, want ErrQuota", err)
+	}
+	fill(m)
+	other := req
+	other.Limits.MemoryMiB = 512 // not pooled: the reserve path
+	if _, err := m.Create(ctx, other); !errors.Is(err, ErrQuota) {
+		t.Fatalf("create over quota by fresh start = %v, want ErrQuota", err)
+	}
+	if _, err := m.Create(ctx, CreateRequest{Owner: "b", Image: "default", Limits: testLimits, Egress: none, Quota: 2}); err != nil {
+		t.Errorf("another owner hit the first owner's quota: %v", err)
+	}
+	if err := m.Delete(ctx, "a", first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Create(ctx, req); err != nil {
+		t.Errorf("create after a delete within quota: %v", err)
 	}
 }

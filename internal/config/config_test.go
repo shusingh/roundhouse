@@ -44,6 +44,11 @@ func TestParseRejects(t *testing.T) {
 		"malformed yaml":         {"api_keys: [\n", "decode config"},
 		"tiny pids":              {valid + "sandbox:\n  pids_max: 2\n", "pids_max"},
 		"negative max sandboxes": {valid + "sandbox:\n  max_sandboxes: -1\n", "max_sandboxes"},
+		"empty pool":             {valid + "sandbox:\n  pools:\n    - size: 0\n", "size must be positive"},
+		"oversized pools":        {valid + "sandbox:\n  max_sandboxes: 2\n  pools:\n    - size: 3\n", "more than max_sandboxes"},
+		"duplicate pool shapes":  {valid + "sandbox:\n  pools:\n    - size: 1\n    - size: 2\n", "same image and shape"},
+		"pool above max":         {valid + "sandbox:\n  pools:\n    - size: 1\n      vcpus: 8\n", "within sandbox.max"},
+		"negative budget":        {valid + "host:\n  memory_budget_mib: -1\n", "must not be negative"},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -53,5 +58,26 @@ func TestParseRejects(t *testing.T) {
 				t.Errorf("Parse error = %v, want one containing %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestPoolsInheritSandboxDefaults(t *testing.T) {
+	t.Parallel()
+	c, err := Parse([]byte("api_keys:\n" + keyYAML("alice", "secret") + "sandbox:\n  pools:\n    - size: 4\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Pool{Image: "default", VCPUs: 1, MemoryMiB: 512, Size: 4}
+	if len(c.Sandbox.Pools) != 1 || c.Sandbox.Pools[0] != want {
+		t.Errorf("pools = %+v, want [%+v]", c.Sandbox.Pools, want)
+	}
+}
+
+func TestNegativeKeyQuotaIsRejected(t *testing.T) {
+	t.Parallel()
+	d := Digest("x")
+	_, err := Parse([]byte("api_keys:\n  - name: a\n    max_sandboxes: -1\n    sha256: " + hex.EncodeToString(d[:]) + "\n"))
+	if err == nil || !strings.Contains(err.Error(), "max_sandboxes must not be negative") {
+		t.Errorf("Parse = %v, want a negative quota rejected", err)
 	}
 }

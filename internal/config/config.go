@@ -40,11 +40,21 @@ type Host struct {
 	JailerPath      string `yaml:"jailer_path"`
 	CgroupRoot      string `yaml:"cgroup_root"`
 	CgroupParent    string `yaml:"cgroup_parent"`
-	// UIDBase is the first of max_sandboxes host uids given to VMMs; the
-	// range must not be used by anything else on the host.
+	// UIDBase is the first of max_sandboxes+1 host uids given to VMMs (the
+	// last builds templates); the range must not be used by anything else on
+	// the host.
 	UIDBase int `yaml:"uid_base"`
-	// VMMOverheadMiB is added to guest memory for each jail's memory limit.
+	// VMMOverheadMiB is added to guest memory for each jail's memory limit
+	// and charged to the memory budget with it.
 	VMMOverheadMiB int `yaml:"vmm_overhead_mib"`
+	// MemoryBudgetMiB bounds guest memory plus VMM overhead across all
+	// sandboxes, pooled ones included. Zero means three quarters of the
+	// host's memory.
+	MemoryBudgetMiB int `yaml:"memory_budget_mib"`
+	// VCPUBudget bounds vCPUs across all sandboxes. Zero means twice the
+	// host's CPUs: idle agent sandboxes rarely use their vCPUs, and the
+	// jail's cpu.max still caps each one.
+	VCPUBudget int `yaml:"vcpu_budget"`
 }
 
 // Sandbox sets sandbox capacity, defaults, and maxima.
@@ -56,6 +66,19 @@ type Sandbox struct {
 	PidsMax      int           `yaml:"pids_max"`
 	Defaults     Limits        `yaml:"defaults"`
 	Max          Limits        `yaml:"max"`
+	// Pools are warm pools of started sandboxes, one per image and shape.
+	Pools []Pool `yaml:"pools"`
+	// PoolMaxAge recycles pooled sandboxes older than this.
+	PoolMaxAge time.Duration `yaml:"pool_max_age"`
+}
+
+// Pool asks for a warm pool of sandboxes of one image and shape. A create
+// with the same image, vCPUs, and memory is served from it.
+type Pool struct {
+	Image     string `yaml:"image"`
+	VCPUs     int    `yaml:"vcpus"`
+	MemoryMiB int    `yaml:"memory_mib"`
+	Size      int    `yaml:"size"`
 }
 
 // Limits are per-sandbox resource settings.
@@ -91,6 +114,9 @@ type APIKey struct {
 	Name string `yaml:"name"`
 	// SHA256 is the hex SHA-256 digest of the key.
 	SHA256 string `yaml:"sha256"`
+	// MaxSandboxes caps how many sandboxes this caller may hold at once.
+	// Zero means the host's limits alone apply.
+	MaxSandboxes int `yaml:"max_sandboxes"`
 }
 
 // Digest returns the SHA-256 digest of a presented key, for comparison with
@@ -148,6 +174,13 @@ func (c *Config) applyDefaults() {
 	setDefault(&c.Sandbox.Max.Lifetime, 24*time.Hour)
 	setDefault(&c.Sandbox.Max.IdleTimeout, 2*time.Hour)
 	setDefault(&c.Sandbox.Max.ExecTimeout, time.Hour)
+	setDefault(&c.Sandbox.PoolMaxAge, 30*time.Minute)
+	for i := range c.Sandbox.Pools {
+		p := &c.Sandbox.Pools[i]
+		setDefault(&p.Image, c.Sandbox.Image)
+		setDefault(&p.VCPUs, c.Sandbox.Defaults.VCPUs)
+		setDefault(&p.MemoryMiB, c.Sandbox.Defaults.MemoryMiB)
+	}
 	setDefault(&c.Network.Pool, "10.200.0.0/16")
 	setDefault(&c.Network.BandwidthMbps, 100)
 	setDefault(&c.LogLevel, "info")
@@ -178,6 +211,21 @@ func (c *Config) Validate() error {
 	check(c.Host.VMMOverheadMiB >= 16, "host.vmm_overhead_mib %d: must be at least 16", c.Host.VMMOverheadMiB)
 	check(c.Sandbox.MaxSandboxes > 0, "sandbox.max_sandboxes must be positive")
 	check(c.Sandbox.PidsMax >= 16, "sandbox.pids_max %d: the VMM needs at least 16", c.Sandbox.PidsMax)
+	check(c.Host.MemoryBudgetMiB >= 0 && c.Host.VCPUBudget >= 0,
+		"host.memory_budget_mib and host.vcpu_budget must not be negative (0 means derive from the host)")
+	pooled := 0
+	shapes := map[Pool]bool{}
+	for i, p := range c.Sandbox.Pools {
+		pooled += p.Size
+		key := Pool{Image: p.Image, VCPUs: p.VCPUs, MemoryMiB: p.MemoryMiB}
+		check(p.Size > 0, "sandbox.pools[%d].size must be positive", i)
+		check(p.VCPUs >= 1 && p.VCPUs <= c.Sandbox.Max.VCPUs && p.MemoryMiB >= 128 && p.MemoryMiB <= c.Sandbox.Max.MemoryMiB,
+			"sandbox.pools[%d]: vcpus and memory_mib must be within sandbox.max", i)
+		check(!shapes[key], "sandbox.pools[%d]: another pool has the same image and shape", i)
+		shapes[key] = true
+	}
+	check(pooled <= c.Sandbox.MaxSandboxes, "sandbox.pools: sizes add up to %d, more than max_sandboxes %d", pooled, c.Sandbox.MaxSandboxes)
+	check(c.Sandbox.PoolMaxAge > 0, "sandbox.pool_max_age must be positive")
 	d, m := c.Sandbox.Defaults, c.Sandbox.Max
 	check(d.VCPUs <= m.VCPUs && d.MemoryMiB <= m.MemoryMiB && d.Lifetime <= m.Lifetime &&
 		d.IdleTimeout <= m.IdleTimeout && d.ExecTimeout <= m.ExecTimeout,
@@ -194,6 +242,7 @@ func (c *Config) Validate() error {
 		raw, err := hex.DecodeString(k.SHA256)
 		check(err == nil && len(raw) == sha256.Size,
 			"api_keys[%d].sha256: want 64 hex digits (echo -n KEY | sha256sum)", i)
+		check(k.MaxSandboxes >= 0, "api_keys[%d].max_sandboxes must not be negative", i)
 	}
 	switch c.LogLevel {
 	case "debug", "info", "warn", "error":

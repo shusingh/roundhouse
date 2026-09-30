@@ -28,6 +28,7 @@ const testKey = "rh_integration_key"
 
 type stack struct {
 	client  *apiclient.Client
+	node    *node.Node
 	manager *sandbox.Manager
 	layout  storage.Layout
 	cancel  context.CancelFunc
@@ -44,18 +45,19 @@ func startStack(t *testing.T, extraYAML string) *stack {
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	layout := storage.Layout{Root: cfg.Host.DataDir}
-	manager, err := node.New(cfg, logger)
+	n, err := node.New(cfg, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
+	manager := n.Manager
 	apiServer, err := api.New(cfg, manager, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	if err := manager.Reconcile(ctx); err != nil {
+	if err := manager.Prepare(ctx); err != nil {
 		cancel()
-		t.Fatalf("Reconcile: %v", err)
+		t.Fatalf("Prepare: %v", err)
 	}
 	done := make(chan struct{})
 	go func() {
@@ -83,7 +85,7 @@ func startStack(t *testing.T, extraYAML string) *stack {
 		}
 		assertHostClean(t, layout)
 	})
-	return &stack{client: apiclient.New(srv.URL, testKey), manager: manager, layout: layout, cancel: cancel}
+	return &stack{client: apiclient.New(srv.URL, testKey), node: n, manager: manager, layout: layout, cancel: cancel}
 }
 
 // assertHostClean fails if any Roundhouse jail, cgroup, VMM, or sandbox

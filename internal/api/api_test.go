@@ -104,7 +104,7 @@ const aliceKey = "alice-secret-key"
 func newAPI(t *testing.T) (*fakeSandboxes, *httptest.Server) {
 	t.Helper()
 	d := config.Digest(aliceKey)
-	yaml := "api_keys:\n  - name: alice\n    sha256: " + hex.EncodeToString(d[:]) + "\n"
+	yaml := "api_keys:\n  - name: alice\n    max_sandboxes: 3\n    sha256: " + hex.EncodeToString(d[:]) + "\n"
 	cfg, err := config.Parse([]byte(yaml))
 	if err != nil {
 		t.Fatal(err)
@@ -317,5 +317,22 @@ func TestFiles(t *testing.T) {
 	resp = call(t, srv, http.MethodGet, "/v1/sandboxes/sb-1/files?path=/root/x", aliceKey, nil)
 	if resp.StatusCode != http.StatusBadGateway || errorCode(t, resp) != "sandbox_error" {
 		t.Errorf("sandbox failure: status %d, want 502 sandbox_error", resp.StatusCode)
+	}
+}
+
+func TestCreateCarriesTheKeysQuota(t *testing.T) {
+	t.Parallel()
+	fake, srv := newAPI(t)
+	resp := call(t, srv, http.MethodPost, "/v1/sandboxes", aliceKey, strings.NewReader(`{}`))
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: status %d", resp.StatusCode)
+	}
+	if q := fake.created[0].Quota; q != 3 {
+		t.Errorf("create passed quota %d, want the key's 3", q)
+	}
+	fake.createErr = sandbox.ErrQuota
+	resp = call(t, srv, http.MethodPost, "/v1/sandboxes", aliceKey, strings.NewReader(`{}`))
+	if resp.StatusCode != http.StatusTooManyRequests || errorCode(t, resp) != "quota" || resp.Header.Get("Retry-After") != "" {
+		t.Errorf("over quota: status %d, Retry-After %q; want 429 quota without Retry-After", resp.StatusCode, resp.Header.Get("Retry-After"))
 	}
 }

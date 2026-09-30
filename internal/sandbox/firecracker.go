@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shusingh/roundhouse/internal/agentclient"
@@ -25,6 +26,8 @@ const (
 	jailKernel  = "vmlinux"
 	jailRootfs  = "rootfs.ext4"
 	jailScratch = "scratch.ext4"
+	jailState   = "vm.state"
+	jailMemory  = "vm.mem"
 	jailVsock   = "/v.sock"
 	jailConsole = "console.log"
 	guestCID    = 3
@@ -47,7 +50,7 @@ type FirecrackerConfig struct {
 	VMMOverheadMiB int
 	// PidsMax caps processes and threads in the jail's cgroup.
 	PidsMax int
-	// BootTimeout bounds the whole boot, from jail launch to agent ready.
+	// BootTimeout bounds the whole start, from jail launch to agent ready.
 	BootTimeout time.Duration
 	// ConsoleBytesPerSecond limits how fast a guest can write its console.
 	ConsoleBytesPerSecond int64
@@ -62,15 +65,26 @@ type FirecrackerConfig struct {
 // device (read-only) from the drive configuration.
 const DefaultBootArgs = "console=ttyS0 reboot=k panic=1 pci=off quiet init=/sbin/roundhouse-agent"
 
-// FirecrackerBooter boots sandboxes as jailed Firecracker microVMs.
+// FirecrackerBooter starts sandboxes as jailed Firecracker microVMs, by
+// restoring a template snapshot when one matches and by cold boot otherwise.
 type FirecrackerBooter struct {
 	cfg    FirecrackerConfig
 	logger *slog.Logger
+
+	mu        sync.Mutex
+	templates map[shape]storage.Template // guarded by mu; set by Prepare
+}
+
+// shape identifies the VMs a template can start: its image and machine size.
+type shape struct {
+	image     string
+	vcpus     int
+	memoryMiB int
 }
 
 // NewFirecrackerBooter returns a booter with cfg.
 func NewFirecrackerBooter(cfg FirecrackerConfig, logger *slog.Logger) *FirecrackerBooter {
-	return &FirecrackerBooter{cfg: cfg, logger: logger}
+	return &FirecrackerBooter{cfg: cfg, logger: logger, templates: map[shape]storage.Template{}}
 }
 
 // jailSpec describes the jail for sandbox id. diskBytes is the size of the
@@ -100,27 +114,60 @@ func (b *FirecrackerBooter) jailSpec(id string, uid int, limits Limits, diskByte
 	}
 }
 
-// Boot cold-boots a sandbox: it copies the image's scratch disk, launches the
-// jailed VMM, configures and starts the VM, and waits for the guest agent.
-// On failure every resource created is released.
+// Boot starts a sandbox's VM, restoring the template for its image and shape
+// if one was loaded and cold-booting otherwise, and returns once the guest
+// agent answers and holds the sandbox's identity. On failure every resource
+// created is released.
 func (b *FirecrackerBooter) Boot(ctx context.Context, spec BootSpec) (_ VM, err error) {
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.BootTimeout)
 	defer cancel()
-
 	img, err := b.cfg.Layout.OpenImage(spec.Image)
 	if err != nil {
 		return nil, err
 	}
-	scratch, err := b.cfg.Layout.CreateSandboxDir(spec.ID, img, spec.UID, spec.UID)
+	var vm *firecrackerVM
+	if tpl, ok := b.template(spec.Image, spec.Limits); ok {
+		vm, err = b.launch(ctx, spec, StartRestore, tpl.Scratch, []vmm.JailFile{
+			{Source: img.Rootfs, Name: jailRootfs},
+			{Source: tpl.State, Name: jailState},
+			{Source: tpl.Memory, Name: jailMemory},
+		}, b.restore)
+	} else {
+		vm, err = b.launch(ctx, spec, StartCold, img.Scratch, coldFiles(img), b.coldStart(spec.Limits))
+	}
 	if err != nil {
 		return nil, err
 	}
-	vm := &firecrackerVM{layout: b.cfg.Layout, network: b.cfg.Network, id: spec.ID}
 	defer func() {
 		if err != nil {
-			teardownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-			defer cancel()
-			err = errors.Join(err, vm.Destroy(teardownCtx))
+			err = errors.Join(err, vm.destroyDetached(ctx))
+		}
+	}()
+	if err := assignIdentity(ctx, vm.agent, spec.ID); err != nil {
+		return nil, err
+	}
+	return vm, nil
+}
+
+func coldFiles(img storage.Image) []vmm.JailFile {
+	return []vmm.JailFile{{Source: img.Kernel, Name: jailKernel}, {Source: img.Rootfs, Name: jailRootfs}}
+}
+
+// launch prepares a sandbox's disk and network, launches its jailed VMM,
+// runs start against the VMM's API, and waits for the guest agent. files are
+// linked into the jail beside a private copy of the scratch disk at
+// scratchSource. On failure every resource created is released.
+func (b *FirecrackerBooter) launch(ctx context.Context, spec BootSpec, how StartPath, scratchSource string, files []vmm.JailFile,
+	start func(context.Context, *vmm.Client) error,
+) (_ *firecrackerVM, err error) {
+	scratch, err := b.cfg.Layout.CreateSandboxDir(spec.ID, scratchSource, spec.UID, spec.UID)
+	if err != nil {
+		return nil, err
+	}
+	vm := &firecrackerVM{layout: b.cfg.Layout, network: b.cfg.Network, id: spec.ID, scratch: scratch, path: how}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, vm.destroyDetached(ctx))
 		}
 	}()
 
@@ -133,11 +180,8 @@ func (b *FirecrackerBooter) Boot(ctx context.Context, spec BootSpec) (_ VM, err 
 	if err != nil {
 		return nil, fmt.Errorf("stat scratch disk: %w", err)
 	}
-	jailSpec := b.jailSpec(spec.ID, spec.UID, spec.Limits, scratchInfo.Size(), []vmm.JailFile{
-		{Source: img.Kernel, Name: jailKernel},
-		{Source: img.Rootfs, Name: jailRootfs},
-		{Source: scratch, Name: jailScratch, Writable: true},
-	})
+	files = append(files, vmm.JailFile{Source: scratch, Name: jailScratch, Writable: true})
+	jailSpec := b.jailSpec(spec.ID, spec.UID, spec.Limits, scratchInfo.Size(), files)
 	vm.jailSpec = &jailSpec
 	jail, err := vmm.Launch(ctx, jailSpec)
 	if err != nil {
@@ -149,31 +193,61 @@ func (b *FirecrackerBooter) Boot(ctx context.Context, spec BootSpec) (_ VM, err 
 	if err := api.WaitReady(ctx); err != nil {
 		return nil, err
 	}
-	if err := b.configure(ctx, api, spec.Limits); err != nil {
-		return nil, err
-	}
-	if err := api.Start(ctx); err != nil {
+	if err := start(ctx, api); err != nil {
 		return nil, err
 	}
 	vm.agent = agentclient.New(path.Join(jailSpec.Root(), strings.TrimPrefix(jailVsock, "/")))
 	if err := vm.agent.WaitReady(ctx); err != nil {
 		return nil, fmt.Errorf("guest agent did not come up: %w", err)
 	}
-	if err := assignIdentity(ctx, vm.agent, spec.ID); err != nil {
-		return nil, err
-	}
 	return vm, nil
 }
 
+// coldStart configures a fresh VM and boots its kernel.
+func (b *FirecrackerBooter) coldStart(limits Limits) func(context.Context, *vmm.Client) error {
+	return func(ctx context.Context, api *vmm.Client) error {
+		if err := b.configure(ctx, api, limits); err != nil {
+			return err
+		}
+		return api.Start(ctx)
+	}
+}
+
+// restore loads the template snapshot linked into the jail and resumes it.
+// The console is set first: its output path is not part of a snapshot.
+func (b *FirecrackerBooter) restore(ctx context.Context, api *vmm.Client) error {
+	if err := api.PutSerial(ctx, b.serial()); err != nil {
+		return fmt.Errorf("configure console: %w", err)
+	}
+	err := api.LoadSnapshot(ctx, vmm.SnapshotLoad{
+		SnapshotPath: jailState,
+		MemBackend:   vmm.MemoryBackend{BackendType: vmm.BackendFile, BackendPath: jailMemory},
+		ResumeVM:     true,
+		// Advances the guest's wall clock past the snapshot's age where KVM
+		// supports it (not under nested virtualization); the agent's restore
+		// call sets the clock regardless.
+		ClockRealtime: true,
+	})
+	if err != nil {
+		return fmt.Errorf("restore snapshot: %w", err)
+	}
+	return nil
+}
+
+func (b *FirecrackerBooter) serial() vmm.Serial {
+	return vmm.Serial{
+		OutputPath:  jailConsole,
+		RateLimiter: &vmm.TokenBucket{Size: b.cfg.ConsoleBytesPerSecond, RefillTimeMS: 1000},
+	}
+}
+
 func (b *FirecrackerBooter) configure(ctx context.Context, api *vmm.Client, limits Limits) error {
-	console := b.cfg.ConsoleBytesPerSecond
 	steps := []func() error{
 		func() error {
 			return api.PutMachineConfig(ctx, vmm.MachineConfig{VCPUCount: limits.VCPUs, MemSizeMiB: limits.MemoryMiB})
 		},
 		func() error {
-			args := b.cfg.BootArgs + " " + netns.GuestKernelArgs()
-			return api.PutBootSource(ctx, vmm.BootSource{KernelImagePath: jailKernel, BootArgs: args})
+			return api.PutBootSource(ctx, vmm.BootSource{KernelImagePath: jailKernel, BootArgs: b.kernelArgs()})
 		},
 		func() error {
 			limit := &vmm.RateLimiter{Bandwidth: &vmm.TokenBucket{Size: b.cfg.NetworkBytesPerSecond, RefillTimeMS: 1000}}
@@ -187,12 +261,7 @@ func (b *FirecrackerBooter) configure(ctx context.Context, api *vmm.Client, limi
 		},
 		func() error { return api.PutDrive(ctx, vmm.Drive{DriveID: "scratch", PathOnHost: jailScratch}) },
 		func() error { return api.PutVsock(ctx, vmm.Vsock{GuestCID: guestCID, UDSPath: jailVsock}) },
-		func() error {
-			return api.PutSerial(ctx, vmm.Serial{
-				OutputPath:  jailConsole,
-				RateLimiter: &vmm.TokenBucket{Size: console, RefillTimeMS: 1000},
-			})
-		},
+		func() error { return api.PutSerial(ctx, b.serial()) },
 		func() error {
 			// Plenty for reseeding; bounded so a guest cannot drain host entropy.
 			return api.PutEntropy(ctx, vmm.Entropy{RateLimiter: &vmm.RateLimiter{
@@ -208,24 +277,31 @@ func (b *FirecrackerBooter) configure(ctx context.Context, api *vmm.Client, limi
 	return nil
 }
 
-// assignIdentity gives the guest its sandbox ID and fresh host entropy. A
-// cold-booted guest gets the same call as a restored one, so every sandbox
-// starts the same way (docs/engineering/design.md section 7.3).
+func (b *FirecrackerBooter) kernelArgs() string {
+	return b.cfg.BootArgs + " " + netns.GuestKernelArgs()
+}
+
+// assignIdentity gives the guest its sandbox ID, fresh host entropy, and the
+// host's wall clock. A cold-booted guest gets the same call as a restored
+// one, so every sandbox starts the same way (docs/engineering/design.md
+// section 7.3).
 func assignIdentity(ctx context.Context, agent *agentclient.Client, id string) error {
 	entropy := make([]byte, 64)
 	if _, err := rand.Read(entropy); err != nil {
 		return fmt.Errorf("generate entropy: %w", err)
 	}
-	if err := agent.Restore(ctx, agentproto.RestoreRequest{SandboxID: id, Entropy: entropy}); err != nil {
+	req := agentproto.RestoreRequest{SandboxID: id, Entropy: entropy, UnixNano: time.Now().UnixNano()}
+	if err := agent.Restore(ctx, req); err != nil {
 		return fmt.Errorf("assign sandbox identity: %w", err)
 	}
 	return nil
 }
 
-// Reconcile removes jails, cgroups, and sandbox directories left by a
-// previous run of the control plane. Only names with the Roundhouse prefix
-// are considered.
-func (b *FirecrackerBooter) Reconcile(ctx context.Context) error {
+// Prepare removes jails, cgroups, namespaces, and sandbox directories left by
+// a previous run of the control plane, installs the host firewall, and loads
+// the templates that match this host. Only names with the Roundhouse prefix
+// are touched.
+func (b *FirecrackerBooter) Prepare(ctx context.Context) error {
 	var errs []error
 	seen := map[string]bool{}
 	for _, dir := range []string{
@@ -276,16 +352,21 @@ func (b *FirecrackerBooter) Reconcile(ctx context.Context) error {
 		}
 		b.logger.Warn("removed orphaned sandbox directory", slog.String("sandbox_id", id))
 	}
+	if err := b.loadTemplates(ctx); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
 }
 
-// firecrackerVM is a booted sandbox. Its fields are set during Boot and not
-// changed afterwards.
+// firecrackerVM is a started sandbox. Its fields are set while it starts and
+// not changed afterwards.
 type firecrackerVM struct {
 	layout     storage.Layout
 	network    *netns.Manager
 	hasNetwork bool
 	id         string
+	path       StartPath
+	scratch    string
 	jailSpec   *vmm.JailSpec
 	jail       *vmm.Jail
 	agent      *agentclient.Client
@@ -305,6 +386,18 @@ func (v *firecrackerVM) ReadFile(ctx context.Context, p string, w io.Writer) (in
 
 func (v *firecrackerVM) Exited() (bool, error) {
 	return v.jail.Exited()
+}
+
+func (v *firecrackerVM) StartPath() StartPath { return v.path }
+
+// Claim applies the caller's egress policy to a pooled VM, which was started
+// with none, and gives the guest fresh entropy. The agent answering that
+// call is the claim's health check.
+func (v *firecrackerVM) Claim(ctx context.Context, egress netns.Egress) error {
+	if err := v.network.ApplyEgress(ctx, v.id, egress); err != nil {
+		return fmt.Errorf("apply egress policy: %w", err)
+	}
+	return assignIdentity(ctx, v.agent, v.id)
 }
 
 // Destroy kills the VM and removes its jail and sandbox directory. Every step
@@ -329,4 +422,12 @@ func (v *firecrackerVM) Destroy(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// destroyDetached destroys the VM on a failure path, where ctx may already
+// be done.
+func (v *firecrackerVM) destroyDetached(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	return v.Destroy(ctx)
 }

@@ -48,6 +48,7 @@ type Sandbox struct {
 	ExpiresAt          time.Time `json:"expires_at"`
 	IdleTimeoutSeconds int64     `json:"idle_timeout_seconds"`
 	Egress             string    `json:"egress"`
+	StartPath          string    `json:"start_path"`
 	ActiveCalls        int       `json:"active_calls"`
 }
 

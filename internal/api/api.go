@@ -45,6 +45,7 @@ type Server struct {
 type apiKey struct {
 	owner  string
 	digest [32]byte
+	quota  int
 }
 
 // New returns an API server over sandboxes, with limits and keys from cfg.
@@ -57,14 +58,17 @@ func New(cfg config.Config, sandboxes Sandboxes, logger *slog.Logger) (*Server, 
 		}
 		var d [32]byte
 		copy(d[:], raw)
-		s.keys = append(s.keys, apiKey{owner: k.Name, digest: d})
+		s.keys = append(s.keys, apiKey{owner: k.Name, digest: d, quota: k.MaxSandboxes})
 	}
 	return s, nil
 }
 
 type ctxKey int
 
-const ownerKey ctxKey = iota
+const (
+	ownerKey ctxKey = iota
+	quotaKey
+)
 
 // Handler returns the API's HTTP handler with authentication, request IDs,
 // access logs, and panic recovery.
@@ -96,23 +100,30 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			return
 		}
 		presented := config.Digest(token)
-		owner := ""
-		for _, k := range s.keys {
-			if subtle.ConstantTimeCompare(presented[:], k.digest[:]) == 1 {
-				owner = k.owner
+		var match *apiKey
+		for i := range s.keys {
+			if subtle.ConstantTimeCompare(presented[:], s.keys[i].digest[:]) == 1 {
+				match = &s.keys[i]
 			}
 		}
-		if owner == "" {
+		if match == nil {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "unknown API key")
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ownerKey, owner)))
+		ctx := context.WithValue(r.Context(), ownerKey, match.owner)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, quotaKey, match.quota)))
 	})
 }
 
 func owner(r *http.Request) string {
 	o, _ := r.Context().Value(ownerKey).(string)
 	return o
+}
+
+// quota is the authenticated caller's sandbox quota; zero means none.
+func quota(r *http.Request) int {
+	q, _ := r.Context().Value(quotaKey).(int)
+	return q
 }
 
 // observe assigns a request ID, logs one access line per request (method,
@@ -195,6 +206,9 @@ func (s *Server) writeSandboxError(w http.ResponseWriter, r *http.Request, err e
 	case errors.Is(err, sandbox.ErrCapacity):
 		w.Header().Set("Retry-After", "5")
 		writeError(w, http.StatusTooManyRequests, "capacity", "host is at sandbox capacity")
+	case errors.Is(err, sandbox.ErrQuota):
+		// No Retry-After: waiting does not help until the caller deletes one.
+		writeError(w, http.StatusTooManyRequests, "quota", "this API key holds as many sandboxes as its quota allows")
 	case errors.Is(err, context.Canceled):
 		// The client went away; nobody reads the response.
 	case errors.As(err, &agentErr) && agentErr.StatusCode >= 400 && agentErr.StatusCode < 500:

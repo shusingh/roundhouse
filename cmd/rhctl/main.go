@@ -110,8 +110,8 @@ func create(ctx context.Context, c *apiclient.Client, args []string) error {
 		return err
 	}
 	fmt.Println(sb.ID)
-	fmt.Fprintf(os.Stderr, "ready in %v (%d vCPU, %d MiB, expires %s)\n",
-		time.Since(start).Round(time.Millisecond), sb.VCPUs, sb.MemoryMiB, sb.ExpiresAt.Local().Format(time.TimeOnly))
+	fmt.Fprintf(os.Stderr, "ready in %v by %s (%d vCPU, %d MiB, expires %s)\n",
+		time.Since(start).Round(time.Millisecond), sb.StartPath, sb.VCPUs, sb.MemoryMiB, sb.ExpiresAt.Local().Format(time.TimeOnly))
 	return nil
 }
 

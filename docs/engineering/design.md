@@ -91,8 +91,9 @@ commands.
 - Multiple hosts. The design keeps a node boundary (section 5) so a scheduler
   can be added, but v1 runs on one host.
 - GPU passthrough, Windows guests, and nested virtualization inside sandboxes.
-- Building templates from arbitrary container images. v1 ships one base
-  template built by a script; a template builder is a stretch goal.
+- Building templates from arbitrary container images. v1 builds templates
+  from its own guest images (`roundhoused template build`); container images
+  are future work.
 - Domain-based egress allowlists. v1 filters by address; name-based filtering
   needs DNS or SNI inspection and is recorded as future work.
 - Pause and resume of a user's sandbox across host restarts. Snapshots are
@@ -250,18 +251,31 @@ default; cold boot exists to build templates and as the benchmark baseline.
 
 ### 7.2 Templates
 
-A template is a guest kernel, a read-only root filesystem, a pristine scratch
-disk, and a snapshot taken after the guest has booted, the agent is
-listening, and the file systems are synced. Templates are built by a command
-(`roundhoused template build`) and stored under the data directory with a
-manifest recording the Firecracker version, kernel versions, and CPU model;
-a template whose manifest does not match the host is rejected rather than
-restored.
+A template is a snapshot of a booted guest for one image and one VM shape
+(vCPUs and memory): the VM state, the guest memory file, and the guest's
+scratch disk as it was at the moment of the snapshot. The scratch disk is
+part of the template, not the image's pristine disk: the snapshotted page
+cache and ext4 journal describe that disk, and restoring them over any
+other would corrupt the file system. Because the VM is paused before the
+snapshot, disk and memory are a consistent pair without syncing, and no
+process runs in the guest to sync them (section 7.3).
+
+Templates are built by `roundhoused template build`, which cold-boots the
+guest, waits for the agent to listen, closes every host connection, pauses,
+snapshots, and installs the files under
+`images/<image>/templates/<vcpus>cpu-<mib>mib/` by a directory rename, so a
+reader never sees a partial template. A manifest records the Firecracker
+version, CPU model, SHA-256 digests of the kernel and root file system, the
+guest kernel command line, and the network rate limit (device configuration
+is part of a snapshot). At startup each manifest is compared with the host;
+a template that differs in any field is logged and ignored, and sandboxes of
+its shape cold-boot instead of restoring into a host it was not built for.
 
 Restoring requires the snapshot's disk paths to exist. Because each sandbox
 runs in its own jail, the paths are jail-relative and identical for every
-sandbox; each jail gets hard links to the shared read-only files and its own
-copy of the scratch disk.
+sandbox; each jail gets hard links to the shared read-only files (root file
+system, VM state, memory file) and its own sparse copy of the template's
+scratch disk.
 
 ### 7.3 Clone safety
 
@@ -277,8 +291,13 @@ deals with each consequence explicitly:
   so user space reading from the kernel afterwards is unique.
 - **Agent state**: the agent generates nothing random before the snapshot is
   taken; any per-sandbox identity is assigned after restore.
-- **Time**: snapshots are loaded with `clock_realtime` so the guest wall clock
-  is correct after restore.
+- **Time**: a restored guest's wall clock reads the time its snapshot was
+  taken. Snapshots are loaded with `clock_realtime`, which corrects this
+  where KVM supports it, but it has no effect under nested virtualization
+  (measured: a 3 s old snapshot restored 3 s behind). The agent's restore
+  call therefore also carries the host's wall clock, and the agent sets
+  `CLOCK_REALTIME` from it; the integration suite checks the skew of clones
+  from an aged snapshot.
 - **Network identity**: identical guest IP and MAC addresses are expected and
   safe, because each sandbox has its own network namespace (section 8).
 - **User-space state in the template** (for example, a Python interpreter's
@@ -290,16 +309,27 @@ across them.
 
 ### 7.4 The warm pool
 
-- Each template has a target pool size. A background loop restores sandboxes
-  until the pool is full, bounded by admission (section 11), and a claim takes
-  one in constant time.
+- A pool is configured per image and shape with a target size. The manager
+  starts sandboxes (by restore, or by cold boot if no template matches)
+  until each pool is full, at most two at a time per pool, and a create of
+  that image and shape claims one in constant time.
+- Pooled sandboxes are started with egress `none`. A claim applies the
+  caller's egress policy to the running sandbox (the veth pair, routes, and
+  rules are added to its namespace; the guest's configuration does not
+  change) and sends the agent's restore call again, which reseeds the
+  guest, sets its clock, and doubles as the claim's health check. A
+  sandbox that fails its claim is destroyed and the create falls back to a
+  fresh start.
+- Pooled sandboxes hold uids and budget like any other, but callers come
+  first: the filler never evicts and stops when the host is full, and a
+  create that finds the host full evicts idle pooled sandboxes, oldest
+  first, before answering `429`.
+- Pooled sandboxes older than `pool_max_age` are recycled so the pool does
+  not age, and a failed start pauses that pool's refill for a few seconds.
 - Pooled sandboxes are running and idle. Their memory cost is mostly shared:
   guest memory is mapped privately from the snapshot file, so untouched pages
   are shared page cache. Density measurements report proportional set size,
   not resident size, for this reason.
-- A pooled sandbox is health-checked at claim; a failed one is destroyed and
-  the next is taken. Pool sandboxes older than a limit are recycled so the
-  pool does not age.
 - Limits a caller asks for (vCPUs, memory) must match a pool's shape to be
   claimed; otherwise the request falls back to a restore.
 
@@ -395,8 +425,17 @@ host problem.
 | Host capacity | admission: total memory and vCPU budget, maximum sandboxes | host |
 
 Admission rejects a create that would exceed the host budget with `429` and
-`Retry-After`, rather than overcommitting memory. Per-API-key quotas cap how
-many sandboxes one caller can hold.
+`Retry-After`, rather than overcommitting memory. Each sandbox is charged its
+guest memory plus the configured VMM overhead and its vCPUs. By default the
+memory budget is three quarters of host memory and the vCPU budget twice the
+host's CPUs (idle agent sandboxes rarely use their vCPUs, and each jail's
+`cpu.max` still caps its own); both are configurable.
+
+Per-API-key quotas cap how many sandboxes one caller can hold
+(`api_keys[].max_sandboxes`), so one caller cannot take the whole host. A
+create over the quota gets `429` with the code `quota`, distinct from
+`capacity`, because waiting does not help: the caller must delete one of its
+own sandboxes first.
 
 ## 12. Threat model and containment
 
@@ -518,12 +557,12 @@ cmd/
   rhbench/              benchmark driver
 internal/
   api/                  HTTP handlers, auth, streaming
-  sandbox/              lifecycle, reaper, reconcile
-  pool/                 warm pools
-  admission/            host capacity and per-key quotas
+  sandbox/              lifecycle, reaper, warm pools, templates, booter
+  admission/            host capacity budget
+  node/                 assembles one host's machinery from configuration
   vmm/                  jailer launch and the Firecracker API client
   netns/                namespaces, tap, veth, nftables, address allocation
-  storage/              templates, images, scratch disks
+  storage/              data layout: images, templates, scratch disks
   agentproto/           wire types shared by host and guest
   agentclient/          host side of the agent protocol over vsock
   agent/                guest agent implementation

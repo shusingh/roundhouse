@@ -89,14 +89,14 @@ func TestLayoutSandboxLifecycle(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("chown is not supported on Windows")
 	}
-	scratch, err := l.CreateSandboxDir("sb-1", img, uid, gid)
+	scratch, err := l.CreateSandboxDir("sb-1", img.Scratch, uid, gid)
 	if err != nil {
 		t.Fatalf("CreateSandboxDir: %v", err)
 	}
 	if info, err := os.Stat(scratch); err != nil || info.Mode().Perm() != 0o600 {
 		t.Errorf("scratch disk %s: %v, mode %v; want 0600", scratch, err, info.Mode().Perm())
 	}
-	if _, err := l.CreateSandboxDir("sb-1", img, uid, gid); err == nil {
+	if _, err := l.CreateSandboxDir("sb-1", img.Scratch, uid, gid); err == nil {
 		t.Error("CreateSandboxDir reused an existing sandbox directory")
 	}
 	ids, err := l.SandboxIDs()
@@ -110,8 +110,33 @@ func TestLayoutSandboxLifecycle(t *testing.T) {
 		t.Errorf("second RemoveSandboxDir = %v, want nil", err)
 	}
 	for _, bad := range []string{"../x", "SB", "", "a/b"} {
-		if _, err := l.CreateSandboxDir(bad, img, uid, gid); err == nil {
+		if _, err := l.CreateSandboxDir(bad, img.Scratch, uid, gid); err == nil {
 			t.Errorf("CreateSandboxDir(%q) accepted an invalid id", bad)
 		}
+	}
+}
+
+func TestTemplateDirsFindsOnlyTemplatesWithManifests(t *testing.T) {
+	t.Parallel()
+	l := Layout{Root: t.TempDir()}
+	complete := l.TemplateDir("default", 1, 256)
+	partial := l.TemplateDir("default", 2, 512) // a build that never wrote its manifest
+	for _, dir := range []string{complete, partial} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(TemplateAt(complete).Manifest, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dirs, err := l.TemplateDirs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dirs) != 1 || dirs[0] != complete {
+		t.Errorf("TemplateDirs = %v, want [%s]", dirs, complete)
+	}
+	if filepath.Base(complete) != "1cpu-256mib" {
+		t.Errorf("template directory name = %s, want 1cpu-256mib", filepath.Base(complete))
 	}
 }
