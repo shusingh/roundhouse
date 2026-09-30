@@ -42,6 +42,8 @@ type Stack struct {
 	Manager *sandbox.Manager
 	Layout  storage.Layout
 	Config  config.Config
+	// URL is the API's base URL.
+	URL string
 }
 
 // Start runs a control plane configured by extraYAML (appended to a config
@@ -61,7 +63,7 @@ func Start(t *testing.T, extraYAML string) *Stack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	apiServer, err := api.New(cfg, n.Manager, logger)
+	apiServer, err := api.New(cfg, n.Manager, n.Metrics, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,10 +82,10 @@ func Start(t *testing.T, extraYAML string) *Stack {
 	srv := httptest.NewServer(apiServer.Handler())
 	t.Cleanup(func() {
 		if t.Failed() {
-			consoles, _ := filepath.Glob(filepath.Join(layout.JailBase(), "firecracker", "rh-sb-*", "root", "console.log"))
+			consoles, _ := filepath.Glob(filepath.Join(layout.JailBase(), "firecracker", "rh-sb-*", "root", "logs", "console.log"))
 			for _, c := range consoles {
 				data, _ := os.ReadFile(c) //nolint:gosec // G304: a console log under the test's own data directory
-				t.Logf("console of %s (last 4 KiB):\n%s", filepath.Base(filepath.Dir(filepath.Dir(c))), Tail(string(data), 4096))
+				t.Logf("console of %s (last 4 KiB):\n%s", filepath.Base(filepath.Dir(filepath.Dir(filepath.Dir(c)))), Tail(string(data), 4096))
 			}
 		}
 		srv.Close()
@@ -96,7 +98,7 @@ func Start(t *testing.T, extraYAML string) *Stack {
 		}
 		AssertHostClean(t, layout)
 	})
-	return &Stack{Client: apiclient.New(srv.URL, Key), Node: n, Manager: n.Manager, Layout: layout, Config: cfg}
+	return &Stack{Client: apiclient.New(srv.URL, Key), Node: n, Manager: n.Manager, Layout: layout, Config: cfg, URL: srv.URL}
 }
 
 // RequireHost skips the test unless it runs as root on a host with KVM, the

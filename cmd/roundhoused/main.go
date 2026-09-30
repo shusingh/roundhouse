@@ -80,7 +80,7 @@ func run() error {
 		return err
 	}
 	manager := n.Manager
-	apiServer, err := api.New(cfg, manager, logger)
+	apiServer, err := api.New(cfg, manager, n.Metrics, logger)
 	if err != nil {
 		return err
 	}

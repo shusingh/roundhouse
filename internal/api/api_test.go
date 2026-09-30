@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"github.com/shusingh/roundhouse/internal/agentproto"
 	"github.com/shusingh/roundhouse/internal/config"
 	"github.com/shusingh/roundhouse/internal/sandbox"
+	"github.com/shusingh/roundhouse/internal/telemetry"
 )
 
 // fakeSandboxes records what the API asked for and replays scripted answers.
@@ -26,6 +28,7 @@ type fakeSandboxes struct {
 	mu        sync.Mutex
 	created   []sandbox.CreateRequest
 	createErr error
+	notReady  bool
 	execReq   agentproto.ExecRequest
 	execFn    func(onOutput func(*agentproto.Frame) error) (*agentproto.Frame, error)
 	files     map[string][]byte
@@ -33,6 +36,8 @@ type fakeSandboxes struct {
 }
 
 var created = time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+
+func (f *fakeSandboxes) Ready() bool { return !f.notReady }
 
 func (f *fakeSandboxes) Create(_ context.Context, req sandbox.CreateRequest) (sandbox.Info, error) {
 	f.mu.Lock()
@@ -110,7 +115,7 @@ func newAPI(t *testing.T) (*fakeSandboxes, *httptest.Server) {
 		t.Fatal(err)
 	}
 	fake := &fakeSandboxes{files: map[string][]byte{}}
-	s, err := New(cfg, fake, slog.New(slog.DiscardHandler))
+	s, err := New(cfg, fake, telemetry.NewMetrics(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,5 +339,42 @@ func TestCreateCarriesTheKeysQuota(t *testing.T) {
 	resp = call(t, srv, http.MethodPost, "/v1/sandboxes", aliceKey, strings.NewReader(`{}`))
 	if resp.StatusCode != http.StatusTooManyRequests || errorCode(t, resp) != "quota" || resp.Header.Get("Retry-After") != "" {
 		t.Errorf("over quota: status %d, Retry-After %q; want 429 quota without Retry-After", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+}
+
+func TestReadyzAndMetrics(t *testing.T) {
+	t.Parallel()
+	fake, srv := newAPI(t)
+	fake.notReady = true
+	if resp := call(t, srv, http.MethodGet, "/readyz", "", nil); resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("readyz before prepare: status %d, want 503", resp.StatusCode)
+	}
+	fake.notReady = false
+	if resp := call(t, srv, http.MethodGet, "/readyz", "", nil); resp.StatusCode != http.StatusOK {
+		t.Errorf("readyz after prepare: status %d, want 200", resp.StatusCode)
+	}
+	call(t, srv, http.MethodGet, "/v1/sandboxes/sb-1", aliceKey, nil)
+	resp := call(t, srv, http.MethodGet, "/metrics", "", nil)
+	body := string(resp.Body)
+	for _, want := range []string{
+		`roundhouse_http_requests_total{code="200",route="GET /v1/sandboxes/{id}"} 1`,
+		`roundhouse_http_requests_total{code="503",route="GET /readyz"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics lack %s", want)
+		}
+	}
+	if strings.Contains(body, "sb-1") || strings.Contains(body, "alice") {
+		t.Error("metrics carry a sandbox ID or key name as a label")
+	}
+}
+
+func TestCreateRejectsInvalidRequestsFromTheManager(t *testing.T) {
+	t.Parallel()
+	fake, srv := newAPI(t)
+	fake.createErr = fmt.Errorf("%w: %w", sandbox.ErrInvalid, errors.New("vcpus 3: want 1 or an even number"))
+	resp := call(t, srv, http.MethodPost, "/v1/sandboxes", aliceKey, strings.NewReader(`{}`))
+	if resp.StatusCode != http.StatusBadRequest || errorCode(t, resp) != "invalid_request" {
+		t.Errorf("invalid create: status %d, want 400 invalid_request", resp.StatusCode)
 	}
 }

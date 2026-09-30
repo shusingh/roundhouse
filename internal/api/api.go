@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,10 +21,13 @@ import (
 	"github.com/shusingh/roundhouse/internal/agentproto"
 	"github.com/shusingh/roundhouse/internal/config"
 	"github.com/shusingh/roundhouse/internal/sandbox"
+	"github.com/shusingh/roundhouse/internal/telemetry"
 )
 
 // Sandboxes is the manager as the API uses it.
 type Sandboxes interface {
+	// Ready reports whether the host is prepared to serve creates.
+	Ready() bool
 	Create(ctx context.Context, req sandbox.CreateRequest) (sandbox.Info, error)
 	Get(owner, id string) (sandbox.Info, error)
 	List(owner string) []sandbox.Info
@@ -40,6 +44,7 @@ type Server struct {
 	keys      []apiKey
 	logger    *slog.Logger
 	now       func() time.Time
+	metrics   *telemetry.Metrics
 }
 
 type apiKey struct {
@@ -49,8 +54,8 @@ type apiKey struct {
 }
 
 // New returns an API server over sandboxes, with limits and keys from cfg.
-func New(cfg config.Config, sandboxes Sandboxes, logger *slog.Logger) (*Server, error) {
-	s := &Server{sandboxes: sandboxes, cfg: cfg.Sandbox, logger: logger, now: time.Now}
+func New(cfg config.Config, sandboxes Sandboxes, metrics *telemetry.Metrics, logger *slog.Logger) (*Server, error) {
+	s := &Server{sandboxes: sandboxes, cfg: cfg.Sandbox, metrics: metrics, logger: logger, now: time.Now}
 	for _, k := range cfg.APIKeys {
 		raw, err := hex.DecodeString(k.SHA256)
 		if err != nil || len(raw) != 32 {
@@ -71,21 +76,33 @@ const (
 )
 
 // Handler returns the API's HTTP handler with authentication, request IDs,
-// access logs, and panic recovery.
+// access logs, metrics, and panic recovery.
+//
+// Every route is registered on one mux, each /v1 route wrapped in
+// authentication, so the matched pattern is known to the access log and
+// metrics; a nested mux would hide it.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-
-	v1 := http.NewServeMux()
-	v1.HandleFunc("POST /v1/sandboxes", s.handleCreate)
-	v1.HandleFunc("GET /v1/sandboxes", s.handleList)
-	v1.HandleFunc("GET /v1/sandboxes/{id}", s.handleGet)
-	v1.HandleFunc("DELETE /v1/sandboxes/{id}", s.handleDelete)
-	v1.HandleFunc("POST /v1/sandboxes/{id}/exec", s.handleExec)
-	v1.HandleFunc("PUT /v1/sandboxes/{id}/files", s.handlePutFile)
-	v1.HandleFunc("GET /v1/sandboxes/{id}/files", s.handleGetFile)
-	mux.Handle("/v1/", s.authenticate(v1))
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !s.sandboxes.Ready() {
+			writeError(w, http.StatusServiceUnavailable, "not_ready", "the host is still being prepared")
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.Handle("GET /metrics", s.metrics.Handler())
+	for pattern, h := range map[string]http.HandlerFunc{
+		"POST /v1/sandboxes":           s.handleCreate,
+		"GET /v1/sandboxes":            s.handleList,
+		"GET /v1/sandboxes/{id}":       s.handleGet,
+		"DELETE /v1/sandboxes/{id}":    s.handleDelete,
+		"POST /v1/sandboxes/{id}/exec": s.handleExec,
+		"PUT /v1/sandboxes/{id}/files": s.handlePutFile,
+		"GET /v1/sandboxes/{id}/files": s.handleGetFile,
+	} {
+		mux.Handle(pattern, s.authenticate(h))
+	}
 	return s.observe(mux)
 }
 
@@ -143,10 +160,17 @@ func (s *Server) observe(next http.Handler) http.Handler {
 					writeError(rec, http.StatusInternalServerError, "internal", "internal error")
 				}
 			}
+			elapsed := s.now().Sub(start)
+			route := r.Pattern
+			if route == "" {
+				route = "unmatched"
+			}
+			s.metrics.HTTPRequests.WithLabelValues(route, strconv.Itoa(rec.status)).Inc()
+			s.metrics.HTTPDuration.WithLabelValues(route).Observe(elapsed.Seconds())
 			s.logger.Info("request",
 				slog.String("request_id", requestID), slog.String("method", r.Method),
-				slog.String("path", r.Pattern), slog.String("sandbox_id", r.PathValue("id")),
-				slog.Int("status", rec.status), slog.Duration("duration", s.now().Sub(start)))
+				slog.String("route", route), slog.String("sandbox_id", r.PathValue("id")),
+				slog.Int("status", rec.status), slog.Duration("duration", elapsed))
 		}()
 		next.ServeHTTP(rec, r)
 	})
@@ -199,6 +223,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func (s *Server) writeSandboxError(w http.ResponseWriter, r *http.Request, err error) {
 	var agentErr *agentclient.AgentError
 	switch {
+	case errors.Is(err, sandbox.ErrInvalid):
+		writeError(w, http.StatusBadRequest, "invalid_request", strings.TrimPrefix(err.Error(), sandbox.ErrInvalid.Error()+": "))
 	case errors.Is(err, sandbox.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "no such sandbox")
 	case errors.Is(err, sandbox.ErrNotReady):

@@ -18,6 +18,7 @@ import (
 	"github.com/shusingh/roundhouse/internal/netns"
 	"github.com/shusingh/roundhouse/internal/sandbox"
 	"github.com/shusingh/roundhouse/internal/storage"
+	"github.com/shusingh/roundhouse/internal/telemetry"
 )
 
 // Node is one host's sandbox machinery.
@@ -30,6 +31,9 @@ type Node struct {
 	// TemplateUID is the host uid template builds run as: the one after the
 	// sandboxes' range, so a build never shares a uid with a live sandbox.
 	TemplateUID int
+	// Metrics holds the node's metrics, including a scrape-time view of the
+	// manager's state.
+	Metrics *telemetry.Metrics
 }
 
 // New builds the node. Call Manager.Prepare before serving.
@@ -69,7 +73,9 @@ func New(cfg config.Config, logger *slog.Logger) (*Node, error) {
 	for i, p := range cfg.Sandbox.Pools {
 		pools[i] = sandbox.PoolConfig{Image: p.Image, VCPUs: p.VCPUs, MemoryMiB: p.MemoryMiB, Size: p.Size}
 	}
+	metrics := telemetry.NewMetrics()
 	manager := sandbox.NewManager(sandbox.Config{
+		Metrics:        metrics,
 		MaxSandboxes:   cfg.Sandbox.MaxSandboxes,
 		UIDBase:        cfg.Host.UIDBase,
 		ReapInterval:   cfg.Sandbox.ReapInterval,
@@ -78,7 +84,11 @@ func New(cfg config.Config, logger *slog.Logger) (*Node, error) {
 		Pools:          pools,
 		PoolMaxAge:     cfg.Sandbox.PoolMaxAge,
 	}, booter, logger)
+	if err := metrics.Register(newStateCollector(manager)); err != nil {
+		return nil, fmt.Errorf("register state metrics: %w", err)
+	}
 	return &Node{
+		Metrics:     metrics,
 		Manager:     manager,
 		Booter:      booter,
 		Budget:      budget,

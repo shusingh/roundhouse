@@ -142,7 +142,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		Owner: owner(r), Quota: quota(r), Image: image, Limits: limits, Egress: egress,
 	})
 	switch {
-	case errors.Is(err, sandbox.ErrCapacity), errors.Is(err, sandbox.ErrQuota):
+	case errors.Is(err, sandbox.ErrCapacity), errors.Is(err, sandbox.ErrQuota), errors.Is(err, sandbox.ErrInvalid):
 		s.writeSandboxError(w, r, err)
 	case err != nil:
 		s.logger.Error("create sandbox", slog.String("error", err.Error()))

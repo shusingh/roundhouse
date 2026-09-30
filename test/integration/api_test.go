@@ -5,7 +5,10 @@ package integration
 import (
 	"bytes"
 	"context"
+	"io"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -104,6 +107,14 @@ func TestCrashedVMIsReaped(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := s.Client.Get(ctx, sb.ID); apiclient.IsNotFound(err) {
+			// Its logs are kept for diagnosis.
+			kept, _ := filepath.Glob(filepath.Join(s.Layout.DiagnosticsDir(), "*-"+sb.ID))
+			if len(kept) != 1 || !exists(filepath.Join(kept[0], "reason.txt")) {
+				t.Errorf("diagnostics for the crashed sandbox: %v, want one entry", kept)
+			}
+			for _, d := range kept {
+				_ = os.RemoveAll(d)
+			}
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -150,5 +161,44 @@ func TestLongSilentCommand(t *testing.T) {
 	out, exit := execOut(t, ctx, s.Client, sb.ID, "sh", "-c", "dd if=/dev/zero of=/root/f bs=1M count=16 2>/dev/null && sync && sleep 8 && echo done")
 	if out != "done\n" || exit.ExitCode != 0 {
 		t.Fatalf("long command printed %q, exit %+v", out, exit)
+	}
+}
+
+func TestMetricsAndReadiness(t *testing.T) {
+	s := startStack(t, "")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	get := func(path string) (int, string) {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, s.URL+path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body)
+	}
+	if code, _ := get("/readyz"); code != http.StatusOK {
+		t.Errorf("readyz after Prepare: %d, want 200", code)
+	}
+	sb, err := s.Client.Create(ctx, apiclient.CreateOptions{MemoryMiB: 256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execOut(t, ctx, s.Client, sb.ID, "sh", "-c", "exit 3")
+	_, body := get("/metrics")
+	for _, want := range []string{
+		`roundhouse_sandbox_creates_total{outcome="ok",path="cold"} 1`,
+		`roundhouse_execs_total{outcome="nonzero"} 1`,
+		`roundhouse_sandboxes{state="ready"} 1`,
+		`roundhouse_budget_used{resource="sandboxes"} 1`,
+		`roundhouse_sandbox_start_seconds_count{path="cold"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics lack %s", want)
+		}
+	}
+	if strings.Contains(body, sb.ID) {
+		t.Error("metrics carry a sandbox ID")
 	}
 }

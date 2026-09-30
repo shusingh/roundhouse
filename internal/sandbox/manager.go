@@ -20,11 +20,13 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shusingh/roundhouse/internal/admission"
 	"github.com/shusingh/roundhouse/internal/agentproto"
 	"github.com/shusingh/roundhouse/internal/netns"
+	"github.com/shusingh/roundhouse/internal/telemetry"
 )
 
 // Errors callers branch on.
@@ -41,6 +43,21 @@ var (
 	// ErrUnresponsive means the guest did not finish a command well after its
 	// time limit, which the guest itself should have enforced.
 	ErrUnresponsive = errors.New("sandbox stopped responding")
+	// ErrInvalid means the request itself is invalid.
+	ErrInvalid = errors.New("invalid request")
+)
+
+// Reasons a sandbox is destroyed, for logs and metrics.
+const (
+	reasonDeleted     = "deleted"
+	reasonLifetime    = "lifetime_expired"
+	reasonIdle        = "idle_timeout"
+	reasonVMExited    = "vm_exited"
+	reasonRetry       = "teardown_retry"
+	reasonPoolRecycle = "pool_recycle"
+	reasonEvicted     = "evicted"
+	reasonFailedClaim = "failed_claim"
+	reasonShutdown    = "shutdown"
 )
 
 // StartPath is how a sandbox's VM was started (design.md section 7.1).
@@ -189,6 +206,8 @@ type Config struct {
 	// ExecGrace is how long past a command's time limit the host waits for
 	// the guest's answer before giving up on it. Zero means ten seconds.
 	ExecGrace time.Duration
+	// Metrics receives lifecycle events. Nil means a private set.
+	Metrics *telemetry.Metrics
 	// Now returns the current time; tests replace it.
 	Now func() time.Time
 }
@@ -213,6 +232,8 @@ type Manager struct {
 	refill chan struct{}
 	// starts tracks pool starts in flight, which Shutdown waits for.
 	starts sync.WaitGroup
+	// ready is set once Prepare has succeeded.
+	ready atomic.Bool
 
 	mu        sync.Mutex
 	sandboxes map[string]*sandbox // guarded by mu; pooled sandboxes included
@@ -256,6 +277,9 @@ func NewManager(cfg Config, booter Booter, logger *slog.Logger) *Manager {
 	if cfg.ExecGrace <= 0 {
 		cfg.ExecGrace = 10 * time.Second
 	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = telemetry.NewMetrics()
+	}
 	if cfg.Admission == nil {
 		cfg.Admission, _ = admission.New(admission.Budget{
 			MemoryMiB: math.MaxInt32, VCPUs: math.MaxInt32, Sandboxes: max(cfg.MaxSandboxes, 1),
@@ -292,8 +316,12 @@ func (m *Manager) Prepare(ctx context.Context) error {
 	if err := m.booter.Prepare(ctx); err != nil {
 		return fmt.Errorf("prepare host: %w", err)
 	}
+	m.ready.Store(true)
 	return nil
 }
+
+// Ready reports whether Prepare has finished, so creates can be served.
+func (m *Manager) Ready() bool { return m.ready.Load() }
 
 // Run keeps the pools filled and enforces deadlines until ctx ends. Call
 // Prepare before it, and Shutdown after it to destroy what remains.
@@ -317,12 +345,20 @@ func (m *Manager) Run(ctx context.Context) error {
 // Create returns a new sandbox once its agent answers: a pooled one if a
 // pool of the requested image and shape has one idle, and a freshly started
 // one otherwise.
-func (m *Manager) Create(ctx context.Context, req CreateRequest) (Info, error) {
+func (m *Manager) Create(ctx context.Context, req CreateRequest) (info Info, err error) {
+	start := time.Now()
+	defer func() {
+		path := string(info.StartPath)
+		if err != nil {
+			path = "none"
+		}
+		m.cfg.Metrics.ObserveCreate(path, createOutcome(err), time.Since(start))
+	}()
 	if err := req.Limits.validate(); err != nil {
-		return Info{}, err
+		return Info{}, fmt.Errorf("%w: %w", ErrInvalid, err)
 	}
 	if err := req.Egress.Validate(); err != nil {
-		return Info{}, err
+		return Info{}, fmt.Errorf("%w: %w", ErrInvalid, err)
 	}
 	if info, ok, err := m.claim(ctx, req); ok || err != nil {
 		return info, err
@@ -352,6 +388,21 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (Info, error) {
 	sb.vm = vm
 	m.readyLocked(sb, req.Limits, vm.StartPath())
 	return sb.info, nil
+}
+
+func createOutcome(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, ErrInvalid):
+		return "invalid"
+	case errors.Is(err, ErrCapacity):
+		return "capacity"
+	case errors.Is(err, ErrQuota):
+		return "quota"
+	default:
+		return "failed"
+	}
 }
 
 // charge is what a sandbox of limits takes from the host budget.
@@ -401,7 +452,7 @@ func (m *Manager) claim(ctx context.Context, req CreateRequest) (Info, bool, err
 		sb.info.State = StateStopping
 		sb.info.Owner = ""
 		m.mu.Unlock()
-		_ = m.destroy(context.WithoutCancel(ctx), sb, "failed claim")
+		_ = m.destroy(context.WithoutCancel(ctx), sb, reasonFailedClaim)
 		return Info{}, false, nil
 	}
 	m.mu.Lock()
@@ -447,7 +498,7 @@ func (m *Manager) reserve(ctx context.Context, sb *sandbox, quota int) error {
 		if victim == nil {
 			return err
 		}
-		if m.destroy(context.WithoutCancel(ctx), victim, "evicted for a create") != nil {
+		if m.destroy(context.WithoutCancel(ctx), victim, reasonEvicted) != nil {
 			return err // its resources stay held until the reaper's retry
 		}
 	}
@@ -544,6 +595,7 @@ func (m *Manager) startPooled(ctx context.Context, p *pool, sb *sandbox) {
 	defer m.mu.Unlock()
 	p.starting--
 	if err != nil {
+		m.cfg.Metrics.PoolStarts.WithLabelValues("failed").Inc()
 		m.releaseLocked(sb)
 		if ctx.Err() == nil {
 			p.retryAt = m.cfg.Now().Add(poolRetryDelay)
@@ -551,6 +603,7 @@ func (m *Manager) startPooled(ctx context.Context, p *pool, sb *sandbox) {
 		}
 		return
 	}
+	m.cfg.Metrics.PoolStarts.WithLabelValues("ok").Inc()
 	sb.vm = vm
 	sb.info.State = StatePooled
 	sb.info.StartPath = vm.StartPath()
@@ -600,11 +653,31 @@ func (m *Manager) Exec(ctx context.Context, owner, id string, req agentproto.Exe
 	defer release()
 	backstop, cancel := context.WithTimeout(ctx, req.Timeout()+m.cfg.ExecGrace)
 	defer cancel()
+	start := time.Now()
 	exit, err := vm.Exec(backstop, req, onOutput)
 	if err != nil && ctx.Err() == nil && errors.Is(backstop.Err(), context.DeadlineExceeded) {
-		return nil, fmt.Errorf("%w: no answer %v after the command's time limit", ErrUnresponsive, m.cfg.ExecGrace)
+		err = fmt.Errorf("%w: no answer %v after the command's time limit", ErrUnresponsive, m.cfg.ExecGrace)
+		exit = nil
 	}
+	m.cfg.Metrics.ObserveExec(execOutcome(exit, err), time.Since(start))
 	return exit, err
+}
+
+func execOutcome(exit *agentproto.Frame, err error) string {
+	switch {
+	case errors.Is(err, ErrUnresponsive):
+		return "unresponsive"
+	case err != nil || exit == nil:
+		return "error"
+	case exit.Type == agentproto.FrameError:
+		return "start_failed"
+	case exit.TimedOut:
+		return "timed_out"
+	case exit.ExitCode != 0:
+		return "nonzero"
+	default:
+		return "ok"
+	}
 }
 
 // WriteFile writes a file in one of the owner's sandboxes.
@@ -666,7 +739,7 @@ func (m *Manager) Delete(ctx context.Context, owner, id string) error {
 	if !m.claimForTeardown(sb) {
 		return nil // already stopping
 	}
-	return m.destroy(ctx, sb, "deleted")
+	return m.destroy(ctx, sb, reasonDeleted)
 }
 
 // Reap destroys sandboxes past their lifetime or idle timeout, pooled
@@ -683,18 +756,18 @@ func (m *Manager) Reap(ctx context.Context) {
 	for _, sb := range m.sandboxes {
 		switch {
 		case sb.teardownFailed:
-			candidates = append(candidates, candidate{sb, "teardown retry"})
+			candidates = append(candidates, candidate{sb, reasonRetry})
 		case sb.info.State == StatePooled:
 			if m.cfg.PoolMaxAge > 0 && now.Sub(sb.info.CreatedAt) >= m.cfg.PoolMaxAge {
-				candidates = append(candidates, candidate{sb, "pool recycle"})
+				candidates = append(candidates, candidate{sb, reasonPoolRecycle})
 			} else {
 				candidates = append(candidates, candidate{sb, ""})
 			}
 		case sb.info.State != StateReady:
 		case !now.Before(sb.info.ExpiresAt):
-			candidates = append(candidates, candidate{sb, "lifetime expired"})
+			candidates = append(candidates, candidate{sb, reasonLifetime})
 		case sb.info.ActiveCalls == 0 && now.Sub(sb.info.LastActive) >= sb.info.Limits.IdleTimeout:
-			candidates = append(candidates, candidate{sb, "idle timeout"})
+			candidates = append(candidates, candidate{sb, reasonIdle})
 		default:
 			candidates = append(candidates, candidate{sb, ""})
 		}
@@ -707,7 +780,7 @@ func (m *Manager) Reap(ctx context.Context) {
 			if exited, err := c.sb.vm.Exited(); err != nil || !exited {
 				continue
 			}
-			c.reason = "vm exited"
+			c.reason = reasonVMExited
 		}
 		if m.claimForTeardown(c.sb) {
 			_ = m.destroy(ctx, c.sb, c.reason)
@@ -751,7 +824,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 		if !m.claimForTeardown(sb) {
 			continue
 		}
-		if err := m.destroy(ctx, sb, "shutdown"); err != nil {
+		if err := m.destroy(ctx, sb, reasonShutdown); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -763,21 +836,57 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 // the reaper to retry, so a uid that may still own files is never handed out
 // again early.
 func (m *Manager) destroy(ctx context.Context, sb *sandbox, reason string) error {
+	if d, ok := sb.vm.(diagnoser); ok && (reason == reasonVMExited || reason == reasonFailedClaim) {
+		if dir, err := d.SaveDiagnostics(reason); err != nil {
+			m.logger.Warn("save sandbox diagnostics", slog.String("sandbox_id", sb.info.ID), slog.String("error", err.Error()))
+		} else {
+			m.logger.Warn("sandbox failed; logs kept", slog.String("sandbox_id", sb.info.ID),
+				slog.String("reason", reason), slog.String("diagnostics", dir))
+		}
+	}
 	err := sb.vm.Destroy(ctx)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err != nil {
 		sb.teardownFailed = true
+		m.cfg.Metrics.TeardownFailures.Inc()
 		m.logger.Error("sandbox teardown failed; will retry",
 			slog.String("sandbox_id", sb.info.ID), slog.String("reason", reason), slog.String("error", err.Error()))
 		return fmt.Errorf("destroy sandbox %s: %w", sb.info.ID, err)
 	}
 	m.releaseLocked(sb)
+	m.cfg.Metrics.Destroys.WithLabelValues(reason).Inc()
 	m.logger.Info("sandbox destroyed", slog.String("sandbox_id", sb.info.ID), slog.String("reason", reason))
 	if sb.pool != nil {
 		m.wakeFiller()
 	}
 	return nil
+}
+
+// diagnoser is a VM that can keep its logs after an unexpected failure.
+type diagnoser interface {
+	SaveDiagnostics(reason string) (dir string, err error)
+}
+
+// Stats is a snapshot of the manager's state for monitoring.
+type Stats struct {
+	// ByState counts sandboxes by state, pooled ones included.
+	ByState     map[State]int
+	Pools       []PoolStatus
+	BudgetUsed  admission.Budget
+	BudgetLimit admission.Budget
+}
+
+// Stats returns a snapshot of the manager's state.
+func (m *Manager) Stats() Stats {
+	st := Stats{ByState: map[State]int{}, Pools: m.Pools(),
+		BudgetUsed: m.cfg.Admission.InUse(), BudgetLimit: m.cfg.Admission.Limit()}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, sb := range m.sandboxes {
+		st.ByState[sb.info.State]++
+	}
+	return st
 }
 
 // PoolStatus is one warm pool's occupancy.
