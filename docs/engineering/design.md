@@ -523,15 +523,30 @@ is not revealed.
 
 ## 14. Observability
 
-- Prometheus metrics with the `roundhouse_` prefix: sandbox creates by start
-  path and outcome, start latency histogram per path, exec latency and
-  outcome, active sandboxes by state, pool size and refill rate, admission
-  rejections, reaper actions, cleanup failures, and host budget in use.
-- Structured JSON logs with the sandbox ID on every line. **Command lines,
-  file contents, and command output are never logged**; logs record sizes,
-  exit codes, and durations. Agents send secrets through sandboxes.
-- Firecracker's own logs and metrics are written inside each jail with a size
-  cap and collected on failure for diagnosis.
+- Prometheus metrics on `/metrics` with the `roundhouse_` prefix. Events:
+  creates by start path and outcome (`ok`, `invalid`, `capacity`, `quota`,
+  `failed`), start latency per path, exec outcomes (`ok`, `nonzero`,
+  `timed_out`, `start_failed`, `unresponsive`, `error`) and latency, destroys
+  by reason, teardown failures, pool starts, and API requests by route
+  pattern and status. State, read at scrape time rather than maintained per
+  event: sandboxes by state, each pool's idle, starting, and target counts,
+  and the host budget used and available per resource. Labels come only
+  from fixed sets and route patterns; sandbox IDs, key names, and caller
+  input never become labels.
+- `/readyz` answers `503` until startup preparation (reconciliation and
+  template loading) has finished; `/healthz` answers as soon as the process
+  serves.
+- Structured JSON logs with the sandbox ID and route on every request line.
+  **Command lines, file contents, and command output are never logged**;
+  logs record sizes, exit codes, and durations. Agents send secrets through
+  sandboxes.
+- Each jail's console and Firecracker's own log (warnings and errors) live
+  on a small tmpfs in the jail (8 MiB), which caps them for the sandbox's
+  whole life and charges them to the jail's memory cgroup. When a VM exits
+  unexpectedly, fails its pool claim, or fails to start, both files are
+  copied to `<data>/diagnostics/<time>-<sandbox>/` with a note of the reason,
+  keeping the newest twenty. They stay files for operators: the console
+  carries whatever the guest wrote, so it never enters the host's logs.
 
 ## 15. Benchmark methodology
 
@@ -560,8 +575,12 @@ Three runs per configuration; tables report the median run with the range.
   pool, admission, IP allocation, nftables rule rendering, protocol framing,
   config. The VMM and network layers sit behind small interfaces with fakes
   so the manager is tested without KVM.
-- **Fuzz tests** for the agent protocol decoders on both sides and for path
-  handling in file endpoints.
+- **Fuzz tests** for every decoder of untrusted or operator input: the
+  agent's frame stream, exec and restore requests, the agent's request
+  handling (through the restore endpoint, since a valid exec or file body
+  would act on the test host), the API's create body, egress destinations
+  and the nftables rules they render into, and the configuration file. Each
+  runs its seed corpus in every test run.
 - **Integration tests** (build tag `integration`) boot real microVMs; they
   skip with a clear message when `/dev/kvm` or root is unavailable.
 - **Containment suite** (build tag `containment`) as in section 12.

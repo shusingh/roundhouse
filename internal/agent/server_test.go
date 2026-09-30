@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/goleak"
+
 	"github.com/shusingh/roundhouse/internal/agentproto"
 )
 
@@ -33,7 +35,8 @@ func TestMain(m *testing.M) {
 	if mode := os.Getenv("RH_AGENT_HELPER"); mode != "" {
 		os.Exit(helperMain(mode))
 	}
-	os.Exit(m.Run())
+	// Otherwise fail the tests if any goroutine outlives them.
+	goleak.VerifyTestMain(m)
 }
 
 func helperMain(mode string) int {
