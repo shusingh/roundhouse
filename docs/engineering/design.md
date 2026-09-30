@@ -269,7 +269,9 @@ Every sandbox restored from a template starts with the same memory. Roundhouse
 deals with each consequence explicitly:
 
 - **Kernel randomness**: the guest kernel is 6.1 or later with VMGenID
-  enabled, so the kernel reseeds its generator on restore. In addition the
+  enabled, so the kernel reseeds its generator on restore. Every VM also has a
+  virtio-rng entropy device (Firecracker's `/entropy`), rate limited, which
+  keeps feeding the guest kernel fresh host entropy after a restore. In addition the
   agent, on its first request after restore, receives fresh entropy from the
   host (from `crypto/rand`) and writes it to `/dev/urandom`, crediting none,
   so user space reading from the kernel afterwards is unique.
@@ -385,6 +387,7 @@ host problem.
 | Disk I/O | Firecracker block rate limiter | VMM |
 | Network | Firecracker net rate limiter; egress policy | VMM and host |
 | Execution time | per-exec limit enforced by the agent, and by the host as a backstop | guest and host |
+| Console output | serial console written to a file in the jail through Firecracker's `/serial` device with a byte-rate limit; set again before every restore, because the output path is not part of a snapshot | VMM |
 | Lifetime, idle | reaper | host |
 | Host capacity | admission: total memory and vCPU budget, maximum sandboxes | host |
 
