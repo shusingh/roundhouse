@@ -29,8 +29,13 @@ const (
 	jailState   = "vm.state"
 	jailMemory  = "vm.mem"
 	jailVsock   = "/v.sock"
-	jailConsole = "console.log"
-	guestCID    = 3
+	jailConsole = vmm.LogDir + "/console.log"
+	jailVMMLog  = vmm.LogDir + "/firecracker.log"
+	// jailLogBytes caps the console and the VMM's log together for a
+	// sandbox's whole life: at the console's rate limit, over eight minutes
+	// of continuous output.
+	jailLogBytes = 8 << 20
+	guestCID     = 3
 	// jailPrefix marks every host resource Roundhouse creates for a sandbox,
 	// so reconciliation finds orphans and touches nothing else.
 	jailPrefix = "rh-"
@@ -115,6 +120,7 @@ func (b *FirecrackerBooter) jailSpec(id string, uid int, limits Limits, diskByte
 		NoFileLimit:   1024,
 		NetNS:         netns.NamespacePath(id),
 		Files:         files,
+		LogBytes:      jailLogBytes,
 	}
 }
 
@@ -170,9 +176,17 @@ func (b *FirecrackerBooter) launch(ctx context.Context, spec BootSpec, how Start
 	}
 	vm := &firecrackerVM{layout: b.cfg.Layout, network: b.cfg.Network, id: spec.ID, scratch: scratch, path: how}
 	defer func() {
-		if err != nil {
-			err = errors.Join(err, vm.destroyDetached(ctx))
+		if err == nil {
+			return
 		}
+		// A start that failed on its own, not because the caller gave up,
+		// keeps the VM's logs for diagnosis.
+		if vm.jail != nil && ctx.Err() == nil {
+			if dir, derr := vm.SaveDiagnostics("start_failed"); derr == nil {
+				b.logger.Warn("sandbox start failed; logs kept", slog.String("sandbox_id", spec.ID), slog.String("diagnostics", dir))
+			}
+		}
+		err = errors.Join(err, vm.destroyDetached(ctx))
 	}()
 
 	// The namespace exists before the jailer joins it.
@@ -210,6 +224,9 @@ func (b *FirecrackerBooter) launch(ctx context.Context, spec BootSpec, how Start
 // coldStart configures a fresh VM and boots its kernel.
 func (b *FirecrackerBooter) coldStart(limits Limits) func(context.Context, *vmm.Client) error {
 	return func(ctx context.Context, api *vmm.Client) error {
+		if err := b.startLogger(ctx, api); err != nil {
+			return err
+		}
 		if err := b.configure(ctx, api, limits); err != nil {
 			return err
 		}
@@ -220,6 +237,9 @@ func (b *FirecrackerBooter) coldStart(limits Limits) func(context.Context, *vmm.
 // restore loads the template snapshot linked into the jail and resumes it.
 // The console is set first: its output path is not part of a snapshot.
 func (b *FirecrackerBooter) restore(ctx context.Context, api *vmm.Client) error {
+	if err := b.startLogger(ctx, api); err != nil {
+		return err
+	}
 	if err := api.PutSerial(ctx, b.serial()); err != nil {
 		return fmt.Errorf("configure console: %w", err)
 	}
@@ -234,6 +254,15 @@ func (b *FirecrackerBooter) restore(ctx context.Context, api *vmm.Client) error 
 	})
 	if err != nil {
 		return fmt.Errorf("restore snapshot: %w", err)
+	}
+	return nil
+}
+
+// startLogger sends the VMM's own warnings and errors to the jail's log
+// directory, where they are kept for diagnosis if the VM fails.
+func (b *FirecrackerBooter) startLogger(ctx context.Context, api *vmm.Client) error {
+	if err := api.PutLogger(ctx, vmm.Logger{LogPath: jailVMMLog, Level: "Warning", ShowLevel: true}); err != nil {
+		return fmt.Errorf("configure VMM log: %w", err)
 	}
 	return nil
 }

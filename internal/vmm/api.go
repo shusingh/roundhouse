@@ -54,6 +54,14 @@ type Serial struct {
 	RateLimiter *TokenBucket `json:"rate_limiter,omitempty"`
 }
 
+// Logger directs the VMM's own log to a file in the jail.
+type Logger struct {
+	LogPath       string `json:"log_path"`
+	Level         string `json:"level,omitempty"`
+	ShowLevel     bool   `json:"show_level,omitempty"`
+	ShowLogOrigin bool   `json:"show_log_origin,omitempty"`
+}
+
 // Entropy is a virtio-rng device that feeds the guest kernel's random number
 // generator from the host, including after a snapshot restore.
 type Entropy struct {

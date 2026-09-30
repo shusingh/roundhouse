@@ -74,6 +74,11 @@ func prepareRoot(spec JailSpec) error {
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return fmt.Errorf("create jail root: %w", err)
 	}
+	if spec.LogBytes > 0 {
+		if err := mountLogs(spec); err != nil {
+			return err
+		}
+	}
 	for _, f := range spec.Files {
 		dst := path.Join(root, f.Name)
 		if err := os.MkdirAll(path.Dir(dst), 0o750); err != nil {
@@ -136,6 +141,11 @@ func (j *Jail) Destroy(ctx context.Context) error {
 func DestroyJail(ctx context.Context, spec JailSpec) error {
 	var errs []error
 	if err := killCgroup(ctx, spec.CgroupDir()); err != nil {
+		errs = append(errs, err)
+	}
+	// Unmounting is attempted whatever the spec says: a jail found by
+	// reconciliation has no record of its log size.
+	if err := unmountLogs(spec); err != nil {
 		errs = append(errs, err)
 	}
 	if err := os.RemoveAll(spec.Dir()); err != nil {

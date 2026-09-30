@@ -30,6 +30,9 @@ type Layout struct {
 // JailBase is the jailer's chroot base directory.
 func (l Layout) JailBase() string { return filepath.Join(l.Root, "jail") }
 
+// DiagnosticsDir keeps the logs of sandboxes that failed, for operators.
+func (l Layout) DiagnosticsDir() string { return filepath.Join(l.Root, "diagnostics") }
+
 // SandboxesDir holds one directory per live sandbox.
 func (l Layout) SandboxesDir() string { return filepath.Join(l.Root, "sandboxes") }
 

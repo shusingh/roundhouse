@@ -282,7 +282,7 @@ func TestConsoleFlood(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	victim := create(ctx, t, s, apiclient.CreateOptions{MemoryMiB: 256})
-	console := filepath.Join(s.Layout.JailBase(), "firecracker", "rh-"+victim.ID, "root", "console.log")
+	console := filepath.Join(s.Layout.JailBase(), "firecracker", "rh-"+victim.ID, "root", "logs", "console.log")
 	sizeOf := func() int64 {
 		info, err := os.Stat(console)
 		if err != nil {
@@ -446,6 +446,16 @@ func TestGuestKernelPanicIsReaped(t *testing.T) {
 	if harness.Exists(jailCgroup(victim.ID)) || harness.Exists(s.Layout.SandboxDir(victim.ID)) {
 		t.Error("the panicked sandbox's cgroup or directory survived its reaping")
 	}
+	// The console of the dead guest is kept for diagnosis.
+	kept, _ := filepath.Glob(filepath.Join(s.Layout.DiagnosticsDir(), "*-"+victim.ID, "console.log"))
+	if len(kept) != 1 {
+		t.Fatalf("diagnostics for %s: %v, want one kept console", victim.ID, kept)
+	}
+	console, _ := os.ReadFile(kept[0]) //nolint:gosec // G304: a file this test's stack wrote
+	if !strings.Contains(string(console), "Kernel panic") {
+		t.Errorf("the kept console lacks the panic:\n%s", harness.Tail(string(console), 1024))
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(filepath.Dir(kept[0])) })
 	waitResponsive(ctx, t, s.Client, neighbor.ID)
 }
 

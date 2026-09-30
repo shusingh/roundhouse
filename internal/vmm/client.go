@@ -121,6 +121,12 @@ func (c *Client) PutEntropy(ctx context.Context, e Entropy) error {
 	return c.do(ctx, http.MethodPut, "/entropy", e)
 }
 
+// PutLogger configures the VMM's own log. It must precede boot or snapshot
+// load.
+func (c *Client) PutLogger(ctx context.Context, l Logger) error {
+	return c.do(ctx, http.MethodPut, "/logger", l)
+}
+
 // Start boots a configured VM.
 func (c *Client) Start(ctx context.Context) error {
 	return c.do(ctx, http.MethodPut, "/actions", instanceAction{ActionType: "InstanceStart"})

@@ -74,7 +74,13 @@ type JailSpec struct {
 	NetNS string
 	// Files are linked into the jail root before launch.
 	Files []JailFile
+	// LogBytes, if positive, is the size of a tmpfs mounted at LogDir in the
+	// jail root for the console and the VMM's own log.
+	LogBytes int64
 }
+
+// LogDir is the jail-relative directory for the console and the VMM's log.
+const LogDir = "logs"
 
 // Validate reports the first problem with the spec.
 func (s JailSpec) Validate() error {
