@@ -51,6 +51,8 @@ type Server struct {
 	reseed func([]byte) error
 	// setClock sets the guest's wall clock.
 	setClock func(time.Time) error
+	// workload is a descriptor for the cgroup commands run in, or -1.
+	workload int
 
 	mu        sync.Mutex
 	sandboxID string // guarded by mu
@@ -59,7 +61,7 @@ type Server struct {
 
 // NewServer returns a server that logs with logger.
 func NewServer(logger *slog.Logger) *Server {
-	return &Server{logger: logger, start: time.Now(), reseed: reseedKernel, setClock: setWallClock}
+	return &Server{logger: logger, start: time.Now(), reseed: reseedKernel, setClock: setWallClock, workload: openWorkloadCgroup()}
 }
 
 // Handler returns the HTTP handler for the agent protocol.
@@ -118,7 +120,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	cmd.Stdin = bytes.NewReader(req.Stdin)
 	cmd.WaitDelay = waitDelay
-	configureProcessGroup(cmd)
+	configureCommand(cmd, s.workload)
 
 	frames := make(chan *agentproto.Frame)
 	cmd.Stdout = &chunkWriter{kind: agentproto.FrameStdout, out: frames}

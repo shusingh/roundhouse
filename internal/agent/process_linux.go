@@ -10,11 +10,16 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// configureProcessGroup puts the command in its own process group and makes
-// cancellation (time limit or host hang-up) kill the whole group, so children
-// the command started do not outlive it.
-func configureProcessGroup(cmd *exec.Cmd) {
+// configureCommand starts the command inside the workload cgroup (unless
+// cgroupFD is -1) and in its own process group, and makes cancellation (time
+// limit or host hang-up) kill the whole group, so children the command
+// started do not outlive it.
+func configureCommand(cmd *exec.Cmd, cgroupFD int) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if cgroupFD >= 0 {
+		cmd.SysProcAttr.UseCgroupFD = true
+		cmd.SysProcAttr.CgroupFD = cgroupFD
+	}
 	cmd.Cancel = func() error {
 		// With Setpgid the group ID equals the leader's PID.
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)

@@ -59,6 +59,11 @@ func RunInit(logger *slog.Logger) error {
 	if err := writeResolvConf(); err != nil {
 		logger.Warn("write resolv.conf", slog.String("error", err.Error()))
 	}
+	if err := setupWorkloadCgroup(); err != nil {
+		// Commands still run, without the guest-side limits; the host's
+		// limits on the VM still hold.
+		logger.Warn("workload cgroup", slog.String("error", err.Error()))
+	}
 	superviseServer(logger)
 	return nil
 }
