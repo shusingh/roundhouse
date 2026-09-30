@@ -1,0 +1,17 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Guest images and Firecracker binaries are downloaded or built, never committed
+/images/out/
+
+# Benchmark raw data (summaries are committed)
+/bench/results/**/*.jsonl
+
+# Local environment and run state
+.env
+*.local.yaml
+/.run/

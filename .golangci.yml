@@ -1,0 +1,50 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - contextcheck
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - noctx
+    - revive
+    - sloglint
+    - unconvert
+    - unparam
+    - usestdlibvars
+  settings:
+    errcheck:
+      exclude-functions:
+        # Closing an HTTP response body cannot fail in a way callers can act on.
+        - (io.ReadCloser).Close
+    gosec:
+      excludes:
+        # G104 duplicates errcheck, which owns unchecked-error policy above.
+        - G104
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: var-naming
+        - name: indent-error-flow
+        - name: error-strings
+        - name: receiver-naming
+    sloglint:
+      attr-only: true
+      no-global: "all"
+
+  exclusions:
+    rules:
+      # Tests read fixtures from testdata by name; the paths are not input.
+      - path: _test\.go
+        linters: [gosec]
+        text: G304
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

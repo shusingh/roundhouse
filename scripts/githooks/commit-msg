@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Rejects commit messages that carry co-author trailers or generation
+# attributions. Commits in this repository are authored by their committer
+# alone (see docs/engineering/coding-standards.md section 16).
+#
+# Extra patterns, one extended regex per line, can be added locally in
+# .git/info/commit-msg-deny without committing them.
+set -euo pipefail
+
+msg_file=$1
+patterns=('^co-authored-by:' 'generated (with|by)')
+
+deny_file="$(git rev-parse --git-dir)/info/commit-msg-deny"
+if [[ -f "$deny_file" ]]; then
+  while IFS= read -r line; do
+    [[ -n "$line" && "$line" != \#* ]] && patterns+=("$line")
+  done <"$deny_file"
+fi
+
+for pattern in "${patterns[@]}"; do
+  if grep -Eiq -- "$pattern" "$msg_file"; then
+    echo "commit-msg: message matches a disallowed pattern ($pattern); edit it and retry." >&2
+    exit 1
+  fi
+done
