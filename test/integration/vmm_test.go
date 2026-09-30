@@ -78,15 +78,15 @@ func jailSpec(t *testing.T, name string, files ...vmm.JailFile) vmm.JailSpec {
 	}
 }
 
-func launch(t *testing.T, spec vmm.JailSpec) (*vmm.Jail, *vmm.Client) {
+func launch(ctx context.Context, t *testing.T, spec vmm.JailSpec) (*vmm.Jail, *vmm.Client) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	jail, err := vmm.Launch(ctx, spec)
 	if err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
-	t.Cleanup(func() { assertGone(t, spec, jail) })
+	t.Cleanup(func() { assertGone(context.WithoutCancel(ctx), t, spec, jail) })
 	client := vmm.NewClient(spec.SocketPath())
 	t.Cleanup(client.Close)
 	if err := client.WaitReady(ctx); err != nil {
@@ -96,9 +96,9 @@ func launch(t *testing.T, spec vmm.JailSpec) (*vmm.Jail, *vmm.Client) {
 }
 
 // assertGone destroys the jail and checks that nothing is left behind.
-func assertGone(t *testing.T, spec vmm.JailSpec, jail *vmm.Jail) {
+func assertGone(ctx context.Context, t *testing.T, spec vmm.JailSpec, jail *vmm.Jail) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := jail.Destroy(ctx); err != nil {
 		t.Errorf("Destroy: %v", err)
@@ -113,7 +113,7 @@ func assertGone(t *testing.T, spec vmm.JailSpec, jail *vmm.Jail) {
 	}
 }
 
-func configureBoot(t *testing.T, ctx context.Context, c *vmm.Client) {
+func configureBoot(ctx context.Context, t *testing.T, c *vmm.Client) {
 	t.Helper()
 	steps := []func() error{
 		func() error { return c.PutMachineConfig(ctx, vmm.MachineConfig{VCPUCount: 1, MemSizeMiB: 256}) },
@@ -151,12 +151,12 @@ func waitConsole(t *testing.T, spec vmm.JailSpec, marker string, n int, timeout 
 
 func TestBootJailedVM(t *testing.T) {
 	requireHost(t)
-	spec := jailSpec(t, "boot")
-	jail, client := launch(t, spec)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	spec := jailSpec(t, "boot")
+	jail, client := launch(ctx, t, spec)
 
-	configureBoot(t, ctx, client)
+	configureBoot(ctx, t, client)
 	start := time.Now()
 	if err := client.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -187,8 +187,8 @@ func TestSnapshotRestoreIntoNewJail(t *testing.T) {
 
 	// Boot, then snapshot inside the first jail.
 	first := jailSpec(t, "snap")
-	firstJail, c1 := launch(t, first)
-	configureBoot(t, ctx, c1)
+	firstJail, c1 := launch(ctx, t, first)
+	configureBoot(ctx, t, c1)
 	if err := c1.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestSnapshotRestoreIntoNewJail(t *testing.T) {
 		vmm.JailFile{Source: filepath.Join(keep, "vm.mem"), Name: "vm.mem"},
 	)
 	start := time.Now()
-	_, c2 := launch(t, second)
+	_, c2 := launch(ctx, t, second)
 	if err := c2.PutSerial(ctx, vmm.Serial{OutputPath: "console.log", RateLimiter: &vmm.TokenBucket{Size: 65536, RefillTimeMS: 1000}}); err != nil {
 		t.Fatalf("PutSerial before restore: %v", err)
 	}
