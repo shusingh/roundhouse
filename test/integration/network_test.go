@@ -93,7 +93,7 @@ func TestEgressNone(t *testing.T) {
 	s := startStack(t, "")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	sb, err := s.client.Create(ctx, apiclient.CreateOptions{MemoryMiB: 256})
+	sb, err := s.Client.Create(ctx, apiclient.CreateOptions{MemoryMiB: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestEgressNone(t *testing.T) {
 		host string
 		port int
 	}{{"1.1.1.1", 443}, {"example.com", 443}, {uplinkAddr(t), 22}} {
-		if got := probe(t, ctx, s.client, sb.ID, dst.host, dst.port); got != "fail" {
+		if got := probe(t, ctx, s.Client, sb.ID, dst.host, dst.port); got != "fail" {
 			t.Errorf("egress none reached %s:%d", dst.host, dst.port)
 		}
 	}
@@ -115,20 +115,20 @@ func TestEgressInternetBlocksHostAndPrivateRanges(t *testing.T) {
 	s := startStack(t, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	sb, err := s.client.Create(ctx, apiclient.CreateOptions{MemoryMiB: 256, Egress: &apiclient.Egress{Mode: "internet"}})
+	sb, err := s.Client.Create(ctx, apiclient.CreateOptions{MemoryMiB: 256, Egress: &apiclient.Egress{Mode: "internet"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	neighbor, err := s.client.Create(ctx, apiclient.CreateOptions{MemoryMiB: 256, Egress: &apiclient.Egress{Mode: "internet"}})
+	neighbor, err := s.Client.Create(ctx, apiclient.CreateOptions{MemoryMiB: 256, Egress: &apiclient.Egress{Mode: "internet"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = neighbor
 
-	if got := probe(t, ctx, s.client, sb.ID, "1.1.1.1", 443); got != "ok" {
+	if got := probe(t, ctx, s.Client, sb.ID, "1.1.1.1", 443); got != "ok" {
 		t.Errorf("internet egress could not reach 1.1.1.1:443")
 	}
-	if got := probe(t, ctx, s.client, sb.ID, "example.com", 443); got != "ok" {
+	if got := probe(t, ctx, s.Client, sb.ID, "example.com", 443); got != "ok" {
 		t.Errorf("internet egress could not resolve and reach example.com:443")
 	}
 
@@ -143,7 +143,7 @@ func TestEgressInternetBlocksHostAndPrivateRanges(t *testing.T) {
 		{"cloud metadata", "169.254.169.254", 80},
 		{"private range", "192.168.1.1", 80},
 	} {
-		if got := probe(t, ctx, s.client, sb.ID, dst.host, dst.port); got != "fail" {
+		if got := probe(t, ctx, s.Client, sb.ID, dst.host, dst.port); got != "fail" {
 			t.Errorf("internet egress reached the %s (%s:%d)", dst.name, dst.host, dst.port)
 		}
 	}
@@ -157,21 +157,21 @@ func TestEgressAllowlist(t *testing.T) {
 	s := startStack(t, "")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	sb, err := s.client.Create(ctx, apiclient.CreateOptions{
+	sb, err := s.Client.Create(ctx, apiclient.CreateOptions{
 		MemoryMiB: 256,
 		Egress:    &apiclient.Egress{Mode: "allowlist", Allow: []string{"1.1.1.1:443"}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := probe(t, ctx, s.client, sb.ID, "1.1.1.1", 443); got != "ok" {
+	if got := probe(t, ctx, s.Client, sb.ID, "1.1.1.1", 443); got != "ok" {
 		t.Error("allowlisted 1.1.1.1:443 was unreachable")
 	}
 	for _, dst := range []struct {
 		host string
 		port int
 	}{{"1.0.0.1", 443}, {"1.1.1.1", 80}, {"8.8.8.8", 443}} {
-		if got := probe(t, ctx, s.client, sb.ID, dst.host, dst.port); got != "fail" {
+		if got := probe(t, ctx, s.Client, sb.ID, dst.host, dst.port); got != "fail" {
 			t.Errorf("allowlist let through %s:%d", dst.host, dst.port)
 		}
 	}

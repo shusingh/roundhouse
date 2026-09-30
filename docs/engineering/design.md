@@ -415,14 +415,29 @@ host problem.
 | vCPUs | Firecracker machine config | VM |
 | CPU time | cgroup v2 `cpu.max` on the jail | host |
 | Memory | VM memory size; cgroup `memory.max` above it for VMM overhead | VM and host |
-| Processes | guest `pids` limits for the workload; cgroup `pids.max` for the VMM | guest and host |
+| Processes | guest workload cgroup `pids.max` (1024); cgroup `pids.max` for the VMM | guest and host |
+| Guest memory for commands | guest workload cgroup `memory.max`, 32 MiB below guest memory | guest |
 | Disk space | scratch image size | host file |
-| Disk I/O | Firecracker block rate limiter | VMM |
+| Disk I/O | Firecracker block rate limiter on each drive (bytes and operations per second) | VMM |
 | Network | Firecracker net rate limiter; egress policy | VMM and host |
 | Execution time | per-exec limit enforced by the agent, and by the host as a backstop | guest and host |
 | Console output | serial console written to a file in the jail through Firecracker's `/serial` device with a byte-rate limit; set again before every restore, because the output path is not part of a snapshot | VMM |
 | Lifetime, idle | reaper | host |
 | Host capacity | admission: total memory and vCPU budget, maximum sandboxes | host |
+
+**Guest-side workload limits.** The agent, as init, mounts cgroup v2 and
+creates a `workload` cgroup; every command starts directly inside it
+(`clone3` with `CLONE_INTO_CGROUP`, so not even a moment is spent outside).
+Its memory and process limits sit below the guest's own, so a command that
+exhausts memory or processes is stopped by the guest kernel inside the
+workload while the agent, outside it, keeps answering. The host's limits on
+the VM are the security boundary; these keep a sandbox usable after its
+workload misbehaves.
+
+**Execution time** is enforced twice: the agent kills a command's process
+group at its time limit, and the host abandons the call ten seconds after
+that limit if the guest has not answered, so a hung guest cannot hold an
+API call open.
 
 Admission rejects a create that would exceed the host budget with `429` and
 `Retry-After`, rather than overcommitting memory. Each sandbox is charged its
@@ -463,21 +478,28 @@ SMT and kernel same-page merging; the development host does not), host
 kernel and KVM zero-days, and denial of service against the API itself beyond
 admission limits.
 
-**Containment suite** (runs against real microVMs; each test asserts the host
-and a neighbor sandbox stay healthy, with the neighbor's command latency
-measured throughout):
+**Containment suite** (`test/containment`, runs against real microVMs; each
+test asserts the host and a neighbor sandbox stay healthy, with the
+neighbor's command latency measured throughout, and ends with a leak scan).
+Measured on the development host (nested KVM), where a neighbor's p95
+latency for a trivial command stayed between 2 and 6 ms under every
+attack:
 
 | Attack | Expected outcome |
 |---|---|
-| Fork bomb | Guest becomes unresponsive or kills processes; host process count unchanged; neighbor latency within bounds |
-| Memory hog | Guest out-of-memory killer acts; host memory for the jail never exceeds its cgroup limit |
-| Disk fill | Writes fail with no space; host file size never exceeds the scratch image size |
-| CPU spin on all vCPUs | Neighbor latency within bounds |
-| Egress with policy `none` | No route; connection attempts fail |
-| Reach host, neighbor, metadata, private ranges with policy `internet` | Dropped |
-| Bandwidth flood | Throughput capped at the configured rate |
-| Destroy, then scan | No process, cgroup, namespace, tap, veth, nftables rule, or file left |
-| Many restores from one snapshot | Random output and UUIDs differ across sandboxes |
+| Attack | Expected outcome | Measured |
+|---|---|---|
+| Fork bomb | Workload capped; host process count unchanged; sandbox usable afterwards | Workload peaked at its 1024-process cap; the agent answered right after |
+| Memory hog | Guest OOM killer acts inside the workload; the host never OOM-kills the VMM | Killed in the guest in under 2 s; host `oom_kill` 0; jail `memory.peak` below `memory.max` |
+| Disk fill | Writes fail with no space; host file never exceeds the image size | Stopped at 1931 MiB allocated of 2048 MiB; the sandbox wrote again after freeing space |
+| CPU spin on all vCPUs | CPU use held to the jail's `cpu.max` | 12.0 s of CPU in 6.0 s with 2 vCPUs |
+| Console flood | Console log growth bounded by its rate | 109 KB in 5 s at 16 KiB/s, within one bucket of the rate |
+| Bandwidth flood | Throughput capped at the configured rate | Steady 0.999 MB/s at a 1.000 MB/s cap; the first second carries a burst of about 2.6 MB |
+| Guest kernel panic | VM exits, sandbox reaped, resources released | Reaped within 3 s |
+| Destroy, then create | Nothing written by a destroyed sandbox is visible to a later one, pooled or not | Holds |
+| Egress with policy `none`; host, neighbor, metadata, private ranges with `internet` | No route; dropped | Integration suite (`network_test.go`) |
+| Many restores from one snapshot | Random output and UUIDs differ across sandboxes | Integration suite (`pool_test.go`) |
+| Destroy, then scan | No process, cgroup, namespace, tap, veth, nftables rule, or file left | Checked after every test |
 
 ## 13. API
 

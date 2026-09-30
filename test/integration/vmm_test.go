@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/shusingh/roundhouse/internal/vmm"
+	"github.com/shusingh/roundhouse/test/harness"
 )
 
 const (
@@ -39,22 +40,10 @@ const (
 
 func requireHost(t *testing.T) {
 	t.Helper()
-	switch {
-	case os.Geteuid() != 0:
-		t.Skip("needs root: run with `make integration`")
-	case !exists("/dev/kvm"):
-		t.Skip("needs /dev/kvm")
-	case !exists("/usr/local/bin/jailer"):
-		t.Skip("needs the jailer: run `make host-setup`")
-	case !exists(filepath.Join(imageDir, "vmlinux")):
-		t.Skip("needs base images: run `sudo bash images/fetch-base.sh`")
-	}
+	harness.RequireHost(t)
 }
 
-func exists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
-}
+func exists(p string) bool { return harness.Exists(p) }
 
 // jailSpec returns a spec for a test jail with a unique ID and uid.
 func jailSpec(t *testing.T, name string, files ...vmm.JailFile) vmm.JailSpec {

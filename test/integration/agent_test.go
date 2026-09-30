@@ -17,6 +17,7 @@ import (
 	"github.com/shusingh/roundhouse/internal/agentclient"
 	"github.com/shusingh/roundhouse/internal/agentproto"
 	"github.com/shusingh/roundhouse/internal/vmm"
+	"github.com/shusingh/roundhouse/test/harness"
 )
 
 const guestImageDir = "/var/lib/roundhouse/images/default"
@@ -25,10 +26,7 @@ const agentBootArgs = "console=ttyS0 reboot=k panic=1 pci=off quiet init=/sbin/r
 
 func requireGuestImage(t *testing.T) {
 	t.Helper()
-	requireHost(t)
-	if !exists(filepath.Join(guestImageDir, "rootfs.ext4")) {
-		t.Skip("needs the guest image: run `sudo bash images/build-rootfs.sh bin/roundhouse-agent`")
-	}
+	harness.RequireGuestImage(t)
 }
 
 // guestSpec returns a jail spec with the guest image and a fresh scratch disk.
@@ -221,9 +219,4 @@ func TestRestoredClonesAreUnique(t *testing.T) {
 	}
 }
 
-func tail(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[len(s)-n:]
-}
+func tail(s string, n int) string { return harness.Tail(s, n) }
