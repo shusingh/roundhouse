@@ -23,7 +23,8 @@ mkdir -p "$out" "$state"
 log() { echo "[$(date -u +%H:%M:%S)] $*" >&2; }
 
 keyline=$("$repo/bin/roundhoused" hash-key)
-export ROUNDHOUSE_API_KEY=$(awk '/^key:/ {print $2}' <<<"$keyline")
+ROUNDHOUSE_API_KEY=$(awk '/^key:/ {print $2}' <<<"$keyline")
+export ROUNDHOUSE_API_KEY
 digest=$(awk '/^sha256:/ {print $2}' <<<"$keyline")
 export ROUNDHOUSE_URL=http://127.0.0.1:8490
 
@@ -80,7 +81,7 @@ rm -rf "$tpl_dir"
 write_config ""
 if want cold; then
   start_server
-  for r in $(seq 1 "$runs"); do
+  for _ in $(seq 1 "$runs"); do
     bench start-cold start -n "$n" -c 1 -memory-mib 256
     bench start-cold-c16 start -n "$n" -c 16 -memory-mib 256
   done
@@ -91,7 +92,7 @@ fi
 "$repo/bin/roundhoused" template build -config "$state/roundhoused.yaml" -memory-mib 256 >>"$out/template.log" 2>&1
 if want restore; then
   start_server
-  for r in $(seq 1 "$runs"); do
+  for _ in $(seq 1 "$runs"); do
     bench start-restore start -n "$n" -c 1 -memory-mib 256
     bench start-restore-c16 start -n "$n" -c 16 -memory-mib 256
     bench exec exec -n 10000
@@ -108,7 +109,7 @@ write_config "  pools:
       size: 16"
 if want pool; then
   start_server
-  for r in $(seq 1 "$runs"); do
+  for _ in $(seq 1 "$runs"); do
     bench start-pool start -n "$n" -c 1 -memory-mib 256 -wait-pool
     bench start-pool-c16 start -n "$n" -c 16 -memory-mib 256
   done
@@ -117,7 +118,7 @@ fi
 rm -rf "$tpl_dir"
 
 # 4. Container baselines on the same root file system.
-want baselines && for r in $(seq 1 "$runs"); do
+want baselines && for _ in $(seq 1 "$runs"); do
   bench baseline-runc baseline -runtime /usr/local/bin/runc -bundle "$state/bundle" -n "$n" -exec-n 1000
   bench baseline-runsc baseline -runtime /usr/local/bin/runsc -runtime-args "--network=none" -bundle "$state/bundle" -n "$n" -exec-n 1000
 done

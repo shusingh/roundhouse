@@ -1,0 +1,52 @@
+name: release
+
+# Builds release binaries when a version tag (v1.2.3) is pushed and attaches
+# them, with checksums, to a GitHub release. Roundhouse runs on Linux only:
+# the control plane needs KVM, cgroups, and namespaces, and the agent runs in
+# the guest. rhctl and rhbench are API clients and also build for other
+# systems.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          build() { # CMD OS ARCH
+            ext=""
+            [ "$2" = windows ] && ext=".exe"
+            CGO_ENABLED=0 GOOS=$2 GOARCH=$3 go build -trimpath -ldflags="-s -w" \
+              -o "dist/${1}_${GITHUB_REF_NAME}_${2}_${3}${ext}" "./cmd/$1"
+          }
+          for arch in amd64 arm64; do
+            for cmd in roundhoused roundhouse-agent rhctl rhbench; do
+              build "$cmd" linux "$arch"
+            done
+          done
+          for target in darwin/arm64 windows/amd64; do
+            build rhctl "${target%/*}" "${target#*/}"
+          done
+          (cd dist && sha256sum * > SHA256SUMS)
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes

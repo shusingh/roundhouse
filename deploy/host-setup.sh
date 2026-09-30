@@ -41,7 +41,8 @@ fetch() {
 echo "==> system packages"
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-  nftables iproute2 e2fsprogs squashfs-tools curl ca-certificates acl >/dev/null
+  nftables iproute2 e2fsprogs squashfs-tools curl ca-certificates acl \
+  build-essential >/dev/null # build-essential: a C compiler for the race detector
 
 echo "==> Go ${GO_VERSION}"
 if [[ "$(/usr/local/go/bin/go env GOVERSION 2>/dev/null)" != "go${GO_VERSION}" ]]; then
@@ -80,7 +81,7 @@ sysctl -q -w net.ipv4.ip_forward=1
 echo 'net.ipv4.ip_forward = 1' >/etc/sysctl.d/90-roundhouse.conf
 
 echo "==> data directory ${DATA_DIR}"
-install -d -m 0755 "$DATA_DIR" "$DATA_DIR/images" "$DATA_DIR/templates" "$DATA_DIR/jail" "$DATA_DIR/sandboxes"
+install -d -m 0755 "$DATA_DIR" "$DATA_DIR/images" "$DATA_DIR/jail" "$DATA_DIR/sandboxes"
 
 echo "==> done"
 /usr/local/bin/firecracker --version | head -n 1

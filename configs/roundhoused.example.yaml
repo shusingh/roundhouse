@@ -1,0 +1,79 @@
+# roundhoused configuration. Every field shows its default; only api_keys is
+# required. Unknown fields are rejected. See docs/operations.md.
+
+server:
+  listen: 127.0.0.1:8480
+  # How long a stopping server waits for requests in flight.
+  shutdown_timeout: 30s
+
+log_level: info # debug, info, warn, or error
+
+host:
+  # Everything Roundhouse keeps: images, templates, jails, sandbox disks,
+  # diagnostics. Must be a Linux file system (hard links and sparse files).
+  data_dir: /var/lib/roundhouse
+  firecracker_path: /usr/local/bin/firecracker
+  jailer_path: /usr/local/bin/jailer
+  cgroup_root: /sys/fs/cgroup
+  cgroup_parent: roundhouse
+  # First of max_sandboxes + 1 host uids handed to VMMs (the last builds
+  # templates). Nothing else on the host may use the range.
+  uid_base: 200000
+  # Added to guest memory for each jail's memory limit, and charged to the
+  # memory budget with it.
+  vmm_overhead_mib: 64
+  # Admission budget across all sandboxes, pooled ones included.
+  # 0 means three quarters of host memory, and twice the host's CPUs.
+  memory_budget_mib: 0
+  vcpu_budget: 0
+
+sandbox:
+  image: default
+  max_sandboxes: 64
+  boot_timeout: 10s
+  reap_interval: 1s
+  # Processes and threads in each VMM's host cgroup (not the guest's).
+  pids_max: 64
+  # Block rate limits on each of a sandbox's drives.
+  disk_mib_per_second: 256
+  disk_iops: 10000
+  # What a create gets when it does not ask, and the most it may ask for.
+  defaults:
+    vcpus: 1
+    memory_mib: 512
+    lifetime: 1h
+    idle_timeout: 10m
+    exec_timeout: 1m
+  max:
+    vcpus: 4
+    memory_mib: 4096
+    lifetime: 24h
+    idle_timeout: 2h
+    exec_timeout: 1h
+  # Warm pools, one per image and shape. A create with the same image, vCPUs,
+  # and memory is served from the pool. Needs a template of that shape to
+  # restore from (roundhoused template build); without one, the pool
+  # cold-boots. Empty by default.
+  pools: []
+  #  - image: default   # defaults to sandbox.image
+  #    vcpus: 1         # defaults to sandbox.defaults.vcpus
+  #    memory_mib: 512  # defaults to sandbox.defaults.memory_mib
+  #    size: 8
+  # Pooled sandboxes older than this are replaced.
+  pool_max_age: 30m
+
+network:
+  # Host interface egress leaves by; empty means the default route's.
+  uplink: ""
+  # Split into one /30 per sandbox that has egress.
+  pool: 10.200.0.0/16
+  # Each direction of every sandbox's network device.
+  bandwidth_mbps: 100
+
+# Callers. Only the SHA-256 digest of each key is stored; generate a key and
+# its digest with `roundhoused hash-key`. The name owns the key's sandboxes.
+api_keys:
+  - name: example
+    sha256: 0000000000000000000000000000000000000000000000000000000000000000
+    # Most sandboxes this key may hold at once; 0 means no per-key cap.
+    max_sandboxes: 0

@@ -43,4 +43,4 @@ jobs:
         run: make build
 
       - name: Shell scripts
-        run: shellcheck deploy/*.sh images/*.sh scripts/*.sh scripts/githooks/*
+        run: shellcheck deploy/*.sh images/*.sh bench/*.sh scripts/*.sh scripts/githooks/*

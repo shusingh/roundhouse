@@ -5,6 +5,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 )
 
 func keyYAML(name, key string) string {
@@ -79,5 +82,24 @@ func TestNegativeKeyQuotaIsRejected(t *testing.T) {
 	_, err := Parse([]byte("api_keys:\n  - name: a\n    max_sandboxes: -1\n    sha256: " + hex.EncodeToString(d[:]) + "\n"))
 	if err == nil || !strings.Contains(err.Error(), "max_sandboxes must not be negative") {
 		t.Errorf("Parse = %v, want a negative quota rejected", err)
+	}
+}
+
+// TestExampleConfigMatchesDefaults keeps configs/roundhoused.example.yaml
+// valid and its documented values equal to the real defaults.
+func TestExampleConfigMatchesDefaults(t *testing.T) {
+	t.Parallel()
+	example, err := Load("../../configs/roundhoused.example.yaml")
+	if err != nil {
+		t.Fatalf("example config: %v", err)
+	}
+	d := Digest("x")
+	defaults, err := Parse([]byte("api_keys:\n  - name: example\n    sha256: " + hex.EncodeToString(d[:]) + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	example.APIKeys, defaults.APIKeys = nil, nil
+	if diff := cmp.Diff(defaults, example, cmpopts.EquateEmpty()); diff != "" {
+		t.Errorf("example config differs from the defaults (-defaults +example):\n%s", diff)
 	}
 }
