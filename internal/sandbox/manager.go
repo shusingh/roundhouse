@@ -38,6 +38,9 @@ var (
 	ErrNotReady = errors.New("sandbox is not ready")
 	// ErrQuota means the owner already holds as many sandboxes as it may.
 	ErrQuota = errors.New("owner is at its sandbox quota")
+	// ErrUnresponsive means the guest did not finish a command well after its
+	// time limit, which the guest itself should have enforced.
+	ErrUnresponsive = errors.New("sandbox stopped responding")
 )
 
 // StartPath is how a sandbox's VM was started (design.md section 7.1).
@@ -183,6 +186,9 @@ type Config struct {
 	// PoolMaxAge recycles pooled sandboxes older than this, so a pool does not
 	// age. Zero means never.
 	PoolMaxAge time.Duration
+	// ExecGrace is how long past a command's time limit the host waits for
+	// the guest's answer before giving up on it. Zero means ten seconds.
+	ExecGrace time.Duration
 	// Now returns the current time; tests replace it.
 	Now func() time.Time
 }
@@ -246,6 +252,9 @@ func NewManager(cfg Config, booter Booter, logger *slog.Logger) *Manager {
 	}
 	if cfg.ReapInterval <= 0 {
 		cfg.ReapInterval = time.Second
+	}
+	if cfg.ExecGrace <= 0 {
+		cfg.ExecGrace = 10 * time.Second
 	}
 	if cfg.Admission == nil {
 		cfg.Admission, _ = admission.New(admission.Budget{
@@ -580,14 +589,22 @@ func (m *Manager) List(owner string) []Info {
 	return out
 }
 
-// Exec runs a command in one of the owner's sandboxes. See VM.Exec.
+// Exec runs a command in one of the owner's sandboxes. See VM.Exec. The
+// guest enforces the command's time limit; the host enforces it too, a grace
+// period later, so a guest that stops answering cannot hold a call open.
 func (m *Manager) Exec(ctx context.Context, owner, id string, req agentproto.ExecRequest, onOutput func(*agentproto.Frame) error) (*agentproto.Frame, error) {
 	vm, release, err := m.acquire(owner, id)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
-	return vm.Exec(ctx, req, onOutput)
+	backstop, cancel := context.WithTimeout(ctx, req.Timeout()+m.cfg.ExecGrace)
+	defer cancel()
+	exit, err := vm.Exec(backstop, req, onOutput)
+	if err != nil && ctx.Err() == nil && errors.Is(backstop.Err(), context.DeadlineExceeded) {
+		return nil, fmt.Errorf("%w: no answer %v after the command's time limit", ErrUnresponsive, m.cfg.ExecGrace)
+	}
+	return exit, err
 }
 
 // WriteFile writes a file in one of the owner's sandboxes.

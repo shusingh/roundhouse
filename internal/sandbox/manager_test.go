@@ -539,3 +539,23 @@ func TestQuotaCapsEachOwner(t *testing.T) {
 		t.Errorf("create after a delete within quota: %v", err)
 	}
 }
+
+func TestExecBackstopEndsACallTheGuestNeverAnswers(t *testing.T) {
+	t.Parallel()
+	m, booter, _ := newTestManager(t, 1, func(c *Config) { c.ExecGrace = 50 * time.Millisecond })
+	info := create(t, m, "a")
+	vm := booter.vm(info.ID)
+	vm.execStarted = make(chan struct{}, 1)
+	vm.execRelease = make(chan struct{}) // never released: a hung guest
+	start := time.Now()
+	_, err := m.Exec(context.Background(), "a", info.ID, agentproto.ExecRequest{Argv: []string{"sleep", "1"}, TimeoutMS: 100}, nil)
+	if !errors.Is(err, ErrUnresponsive) {
+		t.Fatalf("Exec against a hung guest = %v, want ErrUnresponsive", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("the backstop took %v, want about 150 ms", elapsed)
+	}
+	if got, _ := m.Get("a", info.ID); got.ActiveCalls != 0 {
+		t.Errorf("active calls after the backstop = %d, want 0", got.ActiveCalls)
+	}
+}
