@@ -233,3 +233,27 @@ func TestValidation(t *testing.T) {
 		t.Error("Create accepted an unknown egress mode")
 	}
 }
+
+func TestApplyEgressUpgradesAPooledNamespaceOnce(t *testing.T) {
+	t.Parallel()
+	m, f := newTestManager(t)
+	ctx := context.Background()
+	if err := m.Create(ctx, "sb-pooled", 100_000, Egress{Mode: ModeNone}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(f.all(), "veth") {
+		t.Fatal("a pooled namespace got a veth pair before any claim")
+	}
+	if err := m.ApplyEgress(ctx, "sb-pooled", Egress{Mode: ModeInternet}); err != nil {
+		t.Fatalf("ApplyEgress: %v", err)
+	}
+	if got := f.all(); !strings.Contains(got, "type veth peer name veth0 netns rh-sb-pooled") || !strings.Contains(got, "masquerade") {
+		t.Errorf("ApplyEgress did not attach the namespace:\n%s", got)
+	}
+	if err := m.ApplyEgress(ctx, "sb-pooled", Egress{Mode: ModeInternet}); err == nil {
+		t.Error("a second ApplyEgress succeeded; it would allocate another /30")
+	}
+	if err := m.ApplyEgress(ctx, "sb-other", Egress{Mode: "bogus"}); err == nil {
+		t.Error("ApplyEgress accepted an invalid policy")
+	}
+}

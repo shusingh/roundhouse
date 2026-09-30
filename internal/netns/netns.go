@@ -253,10 +253,36 @@ func (m *Manager) Create(ctx context.Context, sandboxID string, uid int, egress 
 	), "ip", "-n", ns, "-batch", "-"); err != nil {
 		return err
 	}
+	return m.applyEgress(ctx, sandboxID, egress)
+}
+
+// ApplyEgress gives a sandbox whose network was created with ModeNone the
+// policy egress. The warm pool uses it: pooled sandboxes start with no
+// egress, and a claim applies the policy the caller asked for. On failure
+// the sandbox's network is in an unknown state and must be destroyed.
+func (m *Manager) ApplyEgress(ctx context.Context, sandboxID string, egress Egress) error {
+	if !validID.MatchString(sandboxID) {
+		return fmt.Errorf("sandbox id %q: invalid", sandboxID)
+	}
+	if err := egress.Validate(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	_, attached := m.slots[sandboxID]
+	m.mu.Unlock()
+	if attached {
+		return fmt.Errorf("sandbox %s already has egress", sandboxID)
+	}
+	return m.applyEgress(ctx, sandboxID, egress)
+}
+
+// applyEgress adds the veth pair, routes, and rules for a policy other than
+// ModeNone to an existing namespace.
+func (m *Manager) applyEgress(ctx context.Context, sandboxID string, egress Egress) error {
 	if egress.Mode == ModeNone {
 		return nil
 	}
-
+	ns := NamespaceName(sandboxID)
 	slot, err := m.allocate(sandboxID)
 	if err != nil {
 		return err
