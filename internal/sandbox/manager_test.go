@@ -559,3 +559,13 @@ func TestExecBackstopEndsACallTheGuestNeverAnswers(t *testing.T) {
 		t.Errorf("active calls after the backstop = %d, want 0", got.ActiveCalls)
 	}
 }
+
+func TestPooledSandboxesAreWarmedBeforeTheyAreOffered(t *testing.T) {
+	t.Parallel()
+	m, booter, _ := newTestManager(t, 4, withPool(1))
+	fill(m)
+	vm := booter.vm(booter.ids()[0])
+	if got := vm.lastExecInput.Argv; len(got) != 1 || got[0] != "true" {
+		t.Errorf("pooled sandbox ran %q before being offered, want a warm-up of true", got)
+	}
+}
