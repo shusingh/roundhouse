@@ -8,11 +8,14 @@
 #
 # Needs: make build (bin/roundhoused, bin/rhbench), the guest image, and
 # bench/setup-baselines.sh for the container baselines. Sequential start runs
-# use N creates (default 1000; override with N=...).
+# use N creates (default 1000; override with N=...). SCENARIOS selects what to
+# run (default "cold restore pool baselines").
 set -uo pipefail
 
 runs=${1:-3}
 n=${N:-1000}
+scenarios=" ${SCENARIOS:-cold restore pool baselines} "
+want() { [[ $scenarios == *" $1 "* ]]; }
 repo=$(cd "$(dirname "$0")/.." && pwd)
 out="$repo/bench/results/$(date -u +%Y-%m-%d)"
 state=/var/lib/roundhouse/bench
@@ -75,40 +78,46 @@ tpl_dir=/var/lib/roundhouse/images/default/templates/1cpu-256mib
 # 1. Cold boot: no template for the shape.
 rm -rf "$tpl_dir"
 write_config ""
-start_server
-for r in $(seq 1 "$runs"); do
-  bench start-cold start -n "$n" -c 1 -memory-mib 256
-  bench start-cold-c16 start -n "$n" -c 16 -memory-mib 256
-done
-stop_server
+if want cold; then
+  start_server
+  for r in $(seq 1 "$runs"); do
+    bench start-cold start -n "$n" -c 1 -memory-mib 256
+    bench start-cold-c16 start -n "$n" -c 16 -memory-mib 256
+  done
+  stop_server
+fi
 
 # 2. Restore: a template, no pool.
 "$repo/bin/roundhoused" template build -config "$state/roundhoused.yaml" -memory-mib 256 >>"$out/template.log" 2>&1
-start_server
-for r in $(seq 1 "$runs"); do
-  bench start-restore start -n "$n" -c 1 -memory-mib 256
-  bench start-restore-c16 start -n "$n" -c 16 -memory-mib 256
-  bench exec exec -n 10000
-  bench neighbor neighbor -seconds 10
-  bench density density -memory-mib 256 -reserve-mib 4096
-done
-stop_server
+if want restore; then
+  start_server
+  for r in $(seq 1 "$runs"); do
+    bench start-restore start -n "$n" -c 1 -memory-mib 256
+    bench start-restore-c16 start -n "$n" -c 16 -memory-mib 256
+    bench exec exec -n 10000
+    bench neighbor neighbor -seconds 10
+    bench density density -memory-mib 256 -reserve-mib 4096
+  done
+  stop_server
+fi
 
 # 3. Warm pool: claims measured one at a time with the pool refilled, then
 # 16-way, where claims outpace the refill and some creates restore instead.
 write_config "  pools:
     - memory_mib: 256
       size: 16"
-start_server
-for r in $(seq 1 "$runs"); do
-  bench start-pool start -n "$n" -c 1 -memory-mib 256 -wait-pool
-  bench start-pool-c16 start -n "$n" -c 16 -memory-mib 256
-done
-stop_server
+if want pool; then
+  start_server
+  for r in $(seq 1 "$runs"); do
+    bench start-pool start -n "$n" -c 1 -memory-mib 256 -wait-pool
+    bench start-pool-c16 start -n "$n" -c 16 -memory-mib 256
+  done
+  stop_server
+fi
 rm -rf "$tpl_dir"
 
 # 4. Container baselines on the same root file system.
-for r in $(seq 1 "$runs"); do
+want baselines && for r in $(seq 1 "$runs"); do
   bench baseline-runc baseline -runtime /usr/local/bin/runc -bundle "$state/bundle" -n "$n" -exec-n 1000
   bench baseline-runsc baseline -runtime /usr/local/bin/runsc -runtime-args "--network=none" -bundle "$state/bundle" -n "$n" -exec-n 1000
 done

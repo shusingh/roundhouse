@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/shusingh/roundhouse/internal/agentproto"
@@ -221,6 +222,16 @@ func (c *Client) ReadFile(ctx context.Context, path string, w io.Writer) (int64,
 		return n, fmt.Errorf("read file from guest: %w", err)
 	}
 	return n, nil
+}
+
+// IsConnectionLost reports whether err means the connection to the agent
+// dropped before an answer arrived. After a snapshot restore the guest resets
+// every vsock connection open when it handles Firecracker's transport reset
+// event, which can lag the restore; a connection made in that window is lost
+// this way.
+func IsConnectionLost(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
 }
 
 // AgentError is a non-2xx response from the agent.

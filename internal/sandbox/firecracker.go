@@ -156,7 +156,39 @@ func (b *FirecrackerBooter) Boot(ctx context.Context, spec BootSpec) (_ VM, err 
 	if err := assignIdentity(ctx, vm.agent, spec.ID); err != nil {
 		return nil, err
 	}
+	if vm.path == StartRestore {
+		if err := settle(ctx, vm.agent); err != nil {
+			return nil, err
+		}
+	}
 	return vm, nil
+}
+
+// settle runs one trivial command in a restored guest before it is handed
+// over, retrying once if the connection is lost. It serves two purposes.
+// The guest resets every vsock connection open when it handles the transport
+// reset event Firecracker sends on restore, which can lag the restore under
+// load; a successful round trip here keeps the caller's first call out of
+// that window. And the first command in a restored guest faults in the
+// memory its exec path touches (about 25 ms on the development host, where
+// nested virtualization makes each fault expensive); paying it here keeps it
+// off a warm pool's claims. The command is the agent's own, run after the
+// clone's identity and entropy are set.
+func settle(ctx context.Context, agent *agentclient.Client) error {
+	req := agentproto.ExecRequest{Argv: []string{"true"}, TimeoutMS: 10_000}
+	for attempt := 1; ; attempt++ {
+		exit, err := agent.Exec(ctx, req, func(*agentproto.Frame) error { return nil })
+		if err == nil && exit.Type == agentproto.FrameExit && exit.ExitCode == 0 {
+			return nil
+		}
+		if err == nil {
+			return fmt.Errorf("settle restored guest: command ended %+v", exit)
+		}
+		if attempt == 2 || !agentclient.IsConnectionLost(err) {
+			return fmt.Errorf("settle restored guest: %w", err)
+		}
+		agent.Close() // drop connections from before the reset
+	}
 }
 
 func coldFiles(img storage.Image) []vmm.JailFile {
@@ -335,11 +367,19 @@ func assignIdentity(ctx context.Context, agent *agentclient.Client, id string) e
 	if _, err := rand.Read(entropy); err != nil {
 		return fmt.Errorf("generate entropy: %w", err)
 	}
-	req := agentproto.RestoreRequest{SandboxID: id, Entropy: entropy, UnixNano: time.Now().UnixNano()}
-	if err := agent.Restore(ctx, req); err != nil {
-		return fmt.Errorf("assign sandbox identity: %w", err)
+	// The call is idempotent, so a connection lost to the restore's vsock
+	// reset (see settle) is retried once on a fresh connection.
+	for attempt := 1; ; attempt++ {
+		req := agentproto.RestoreRequest{SandboxID: id, Entropy: entropy, UnixNano: time.Now().UnixNano()}
+		err := agent.Restore(ctx, req)
+		if err == nil {
+			return nil
+		}
+		if attempt == 2 || !agentclient.IsConnectionLost(err) {
+			return fmt.Errorf("assign sandbox identity: %w", err)
+		}
+		agent.Close()
 	}
-	return nil
 }
 
 // Prepare removes jails, cgroups, namespaces, and sandbox directories left by

@@ -6,13 +6,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -234,5 +237,19 @@ func TestWaitReady(t *testing.T) {
 	defer cancel()
 	if err := c.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady: %v", err)
+	}
+}
+
+func TestIsConnectionLost(t *testing.T) {
+	t.Parallel()
+	for _, err := range []error{io.EOF, io.ErrUnexpectedEOF, syscall.ECONNRESET, fmt.Errorf("guest agent POST /x: %w", &url.Error{Op: "Post", URL: "http://agent/x", Err: io.EOF})} {
+		if !IsConnectionLost(err) {
+			t.Errorf("IsConnectionLost(%v) = false", err)
+		}
+	}
+	for _, err := range []error{context.DeadlineExceeded, &AgentError{StatusCode: 400}, errors.New("other")} {
+		if IsConnectionLost(err) {
+			t.Errorf("IsConnectionLost(%v) = true", err)
+		}
 	}
 }

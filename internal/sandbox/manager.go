@@ -591,11 +591,6 @@ func (m *Manager) fillPools(ctx context.Context) {
 // startPooled starts one sandbox for pool p.
 func (m *Manager) startPooled(ctx context.Context, p *pool, sb *sandbox) {
 	vm, err := m.booter.Boot(ctx, BootSpec{ID: sb.info.ID, Image: sb.info.Image, Limits: sb.info.Limits, Egress: sb.info.Egress, UID: sb.uid})
-	if err == nil {
-		if err = warm(ctx, vm); err != nil {
-			err = errors.Join(err, vm.Destroy(context.WithoutCancel(ctx)))
-		}
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p.starting--
@@ -614,24 +609,6 @@ func (m *Manager) startPooled(ctx context.Context, p *pool, sb *sandbox) {
 	sb.info.StartPath = vm.StartPath()
 	sb.info.CreatedAt = m.cfg.Now()
 	p.idle = append(p.idle, sb)
-}
-
-// warm runs one trivial command in a pooled sandbox before it is offered.
-// The first command in a restored guest faults in the guest memory that the
-// agent's exec path touches, which costs about 25 ms on the development host
-// (nested virtualization makes each fault expensive); paying it here keeps it
-// off the claim. It runs after the clone's identity and entropy are set, so
-// it does not weaken clone safety.
-func warm(ctx context.Context, vm VM) error {
-	exit, err := vm.Exec(ctx, agentproto.ExecRequest{Argv: []string{"true"}, TimeoutMS: 10_000},
-		func(*agentproto.Frame) error { return nil })
-	if err != nil {
-		return fmt.Errorf("warm pooled sandbox: %w", err)
-	}
-	if exit.Type != agentproto.FrameExit || exit.ExitCode != 0 {
-		return fmt.Errorf("warm pooled sandbox: command ended %+v", exit)
-	}
-	return nil
 }
 
 // Get returns one of the owner's sandboxes.
