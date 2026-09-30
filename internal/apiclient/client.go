@@ -47,6 +47,7 @@ type Sandbox struct {
 	CreatedAt          time.Time `json:"created_at"`
 	ExpiresAt          time.Time `json:"expires_at"`
 	IdleTimeoutSeconds int64     `json:"idle_timeout_seconds"`
+	Egress             string    `json:"egress"`
 	ActiveCalls        int       `json:"active_calls"`
 }
 
@@ -57,6 +58,15 @@ type CreateOptions struct {
 	MemoryMiB          int    `json:"memory_mib,omitempty"`
 	LifetimeSeconds    int64  `json:"lifetime_seconds,omitempty"`
 	IdleTimeoutSeconds int64  `json:"idle_timeout_seconds,omitempty"`
+	// Egress is nil for no network access.
+	Egress *Egress `json:"egress,omitempty"`
+}
+
+// Egress is an egress policy: Mode "none", "internet", or "allowlist" with
+// Allow entries such as "203.0.113.0/24" or "198.51.100.7:443".
+type Egress struct {
+	Mode  string   `json:"mode"`
+	Allow []string `json:"allow,omitempty"`
 }
 
 // ExecOptions describes one command.

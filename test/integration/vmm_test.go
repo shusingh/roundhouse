@@ -73,7 +73,7 @@ func jailSpec(t *testing.T, name string, files ...vmm.JailFile) vmm.JailSpec {
 		ID: id, JailerPath: "/usr/local/bin/jailer", FirecrackerPath: "/usr/local/bin/firecracker",
 		ChrootBase: chrootBase, CgroupRoot: "/sys/fs/cgroup", CgroupParent: "roundhouse",
 		UID: uid, GID: uid,
-		MemoryMax: 512 << 20, CPUs: 1, PidsMax: 64, FileSizeLimit: 1 << 30, NoFileLimit: 1024,
+		MemoryMax: 512 << 20, CPUs: 1, PidsMax: 64, FileSizeLimit: 4 << 30, NoFileLimit: 1024,
 		Files: files,
 	}
 }

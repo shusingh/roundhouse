@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path"
 	"time"
@@ -21,6 +22,7 @@ type Config struct {
 	Server   Server   `yaml:"server"`
 	Host     Host     `yaml:"host"`
 	Sandbox  Sandbox  `yaml:"sandbox"`
+	Network  Network  `yaml:"network"`
 	APIKeys  []APIKey `yaml:"api_keys"`
 	LogLevel string   `yaml:"log_level"`
 }
@@ -63,6 +65,23 @@ type Limits struct {
 	Lifetime    time.Duration `yaml:"lifetime"`
 	IdleTimeout time.Duration `yaml:"idle_timeout"`
 	ExecTimeout time.Duration `yaml:"exec_timeout"`
+}
+
+// Network configures sandbox networking (docs/engineering/design.md section 8).
+type Network struct {
+	// Uplink is the host interface egress leaves by; empty means the
+	// interface of the default route.
+	Uplink string `yaml:"uplink"`
+	// Pool is the host-side range split into one /30 per sandbox with egress.
+	Pool string `yaml:"pool"`
+	// BandwidthMbps limits each direction of every sandbox's network device.
+	BandwidthMbps int `yaml:"bandwidth_mbps"`
+}
+
+// PoolPrefix returns the parsed address pool.
+func (n Network) PoolPrefix() netip.Prefix {
+	p, _ := netip.ParsePrefix(n.Pool)
+	return p
 }
 
 // APIKey authorizes one caller. Only the key's SHA-256 digest is stored, so a
@@ -129,6 +148,8 @@ func (c *Config) applyDefaults() {
 	setDefault(&c.Sandbox.Max.Lifetime, 24*time.Hour)
 	setDefault(&c.Sandbox.Max.IdleTimeout, 2*time.Hour)
 	setDefault(&c.Sandbox.Max.ExecTimeout, time.Hour)
+	setDefault(&c.Network.Pool, "10.200.0.0/16")
+	setDefault(&c.Network.BandwidthMbps, 100)
 	setDefault(&c.LogLevel, "info")
 }
 
@@ -161,6 +182,10 @@ func (c *Config) Validate() error {
 	check(d.VCPUs <= m.VCPUs && d.MemoryMiB <= m.MemoryMiB && d.Lifetime <= m.Lifetime &&
 		d.IdleTimeout <= m.IdleTimeout && d.ExecTimeout <= m.ExecTimeout,
 		"sandbox.defaults must not exceed sandbox.max")
+	pool, err := netip.ParsePrefix(c.Network.Pool)
+	check(err == nil && pool.Addr().Is4() && pool.Bits() <= 28 && pool == pool.Masked(),
+		"network.pool %q: want a masked IPv4 prefix of /28 or larger, such as 10.200.0.0/16", c.Network.Pool)
+	check(c.Network.BandwidthMbps > 0, "network.bandwidth_mbps must be positive")
 	check(len(c.APIKeys) > 0, "api_keys: at least one key is required")
 	names := map[string]bool{}
 	for i, k := range c.APIKeys {

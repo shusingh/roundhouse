@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/shusingh/roundhouse/internal/agentproto"
+	"github.com/shusingh/roundhouse/internal/netns"
 )
 
 type fakeClock struct {
@@ -103,11 +104,13 @@ func newTestManager(t *testing.T, max int) (*Manager, *fakeBooter, *fakeClock) {
 	return m, booter, clock
 }
 
+var none = netns.Egress{Mode: netns.ModeNone}
+
 var testLimits = Limits{VCPUs: 1, MemoryMiB: 256, Lifetime: time.Hour, IdleTimeout: 5 * time.Minute}
 
 func create(t *testing.T, m *Manager, owner string) Info {
 	t.Helper()
-	info, err := m.Create(context.Background(), CreateRequest{Owner: owner, Image: "default", Limits: testLimits})
+	info, err := m.Create(context.Background(), CreateRequest{Owner: owner, Image: "default", Limits: testLimits, Egress: netns.Egress{Mode: netns.ModeNone}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -124,7 +127,7 @@ func TestCreateAssignsUniqueUIDsAndEnforcesCapacity(t *testing.T) {
 	if ua, ub := booter.vm(a.ID).spec.UID, booter.vm(b.ID).spec.UID; ua == ub || ua < 200_000 || ub < 200_000 {
 		t.Errorf("uids %d and %d, want distinct uids from the configured range", ua, ub)
 	}
-	if _, err := m.Create(context.Background(), CreateRequest{Owner: "alice", Limits: testLimits}); !errors.Is(err, ErrCapacity) {
+	if _, err := m.Create(context.Background(), CreateRequest{Owner: "alice", Limits: testLimits, Egress: none}); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("third Create error = %v, want ErrCapacity", err)
 	}
 	if err := m.Delete(context.Background(), "alice", a.ID); err != nil {
@@ -141,7 +144,7 @@ func TestCreateRejectsInvalidLimits(t *testing.T) {
 		"tiny memory":   {VCPUs: 1, MemoryMiB: 64, Lifetime: time.Hour, IdleTimeout: time.Minute},
 		"zero lifetime": {VCPUs: 1, MemoryMiB: 256, IdleTimeout: time.Minute},
 	} {
-		if _, err := m.Create(context.Background(), CreateRequest{Owner: "a", Limits: l}); err == nil {
+		if _, err := m.Create(context.Background(), CreateRequest{Owner: "a", Limits: l, Egress: none}); err == nil {
 			t.Errorf("%s: Create accepted invalid limits", name)
 		}
 	}
@@ -151,7 +154,7 @@ func TestFailedBootFreesTheSlot(t *testing.T) {
 	t.Parallel()
 	m, booter, _ := newTestManager(t, 1)
 	booter.failBoot = true
-	if _, err := m.Create(context.Background(), CreateRequest{Owner: "a", Limits: testLimits}); err == nil {
+	if _, err := m.Create(context.Background(), CreateRequest{Owner: "a", Limits: testLimits, Egress: none}); err == nil {
 		t.Fatal("Create succeeded although boot failed")
 	}
 	booter.failBoot = false
@@ -254,7 +257,7 @@ func TestFailedTeardownKeepsUIDReservedAndRetries(t *testing.T) {
 	if err := m.Delete(ctx, "a", info.ID); err == nil {
 		t.Fatal("Delete reported success although teardown failed")
 	}
-	if _, err := m.Create(ctx, CreateRequest{Owner: "a", Limits: testLimits}); !errors.Is(err, ErrCapacity) {
+	if _, err := m.Create(ctx, CreateRequest{Owner: "a", Limits: testLimits, Egress: none}); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("Create after a failed teardown = %v, want ErrCapacity: the uid must stay reserved", err)
 	}
 	m.Reap(ctx) // retries the teardown, which now succeeds
@@ -290,7 +293,7 @@ func TestConcurrentCreatesRespectCapacity(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 20 {
 		wg.Go(func() {
-			_, err := m.Create(context.Background(), CreateRequest{Owner: "a", Limits: testLimits})
+			_, err := m.Create(context.Background(), CreateRequest{Owner: "a", Limits: testLimits, Egress: none})
 			switch {
 			case err == nil:
 				ok.Add(1)
@@ -305,11 +308,11 @@ func TestConcurrentCreatesRespectCapacity(t *testing.T) {
 	}
 }
 
-func TestRunReconcilesFirst(t *testing.T) {
+func TestReconcileReportsFailure(t *testing.T) {
 	t.Parallel()
 	m, booter, _ := newTestManager(t, 1)
 	booter.reconcile = errors.New("cannot list jails")
-	if err := m.Run(context.Background()); err == nil {
-		t.Fatal("Run ignored a reconcile failure")
+	if err := m.Reconcile(context.Background()); err == nil {
+		t.Fatal("Reconcile hid a booter failure")
 	}
 }

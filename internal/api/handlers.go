@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/shusingh/roundhouse/internal/agentproto"
+	"github.com/shusingh/roundhouse/internal/netns"
 	"github.com/shusingh/roundhouse/internal/sandbox"
 )
 
@@ -24,6 +25,29 @@ type createRequest struct {
 	MemoryMiB          int    `json:"memory_mib,omitempty"`
 	LifetimeSeconds    int64  `json:"lifetime_seconds,omitempty"`
 	IdleTimeoutSeconds int64  `json:"idle_timeout_seconds,omitempty"`
+	// Egress defaults to mode "none": no network access.
+	Egress *egressRequest `json:"egress,omitempty"`
+}
+
+// egressRequest is a sandbox's egress policy as the API accepts it.
+type egressRequest struct {
+	Mode  string   `json:"mode"`
+	Allow []string `json:"allow,omitempty"`
+}
+
+func parseEgress(req *egressRequest) (netns.Egress, error) {
+	if req == nil {
+		return netns.Egress{Mode: netns.ModeNone}, nil
+	}
+	e := netns.Egress{Mode: netns.Mode(req.Mode)}
+	for _, a := range req.Allow {
+		d, err := netns.ParseDestination(a)
+		if err != nil {
+			return e, err
+		}
+		e.Allow = append(e.Allow, d)
+	}
+	return e, e.Validate()
 }
 
 // sandboxView is a sandbox as the API returns it.
@@ -36,6 +60,7 @@ type sandboxView struct {
 	CreatedAt          time.Time `json:"created_at"`
 	ExpiresAt          time.Time `json:"expires_at"`
 	IdleTimeoutSeconds int64     `json:"idle_timeout_seconds"`
+	Egress             string    `json:"egress"`
 	ActiveCalls        int       `json:"active_calls"`
 }
 
@@ -43,7 +68,8 @@ func view(i sandbox.Info) sandboxView {
 	return sandboxView{
 		ID: i.ID, Image: i.Image, State: string(i.State), VCPUs: i.Limits.VCPUs, MemoryMiB: i.Limits.MemoryMiB,
 		CreatedAt: i.CreatedAt.UTC(), ExpiresAt: i.ExpiresAt.UTC(),
-		IdleTimeoutSeconds: int64(i.Limits.IdleTimeout / time.Second), ActiveCalls: i.ActiveCalls,
+		IdleTimeoutSeconds: int64(i.Limits.IdleTimeout / time.Second), Egress: string(i.Egress.Mode),
+		ActiveCalls: i.ActiveCalls,
 	}
 }
 
@@ -102,11 +128,16 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_limits", err.Error())
 		return
 	}
+	egress, err := parseEgress(req.Egress)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_egress", err.Error())
+		return
+	}
 	image := req.Image
 	if image == "" {
 		image = s.cfg.Image
 	}
-	info, err := s.sandboxes.Create(r.Context(), sandbox.CreateRequest{Owner: owner(r), Image: image, Limits: limits})
+	info, err := s.sandboxes.Create(r.Context(), sandbox.CreateRequest{Owner: owner(r), Image: image, Limits: limits, Egress: egress})
 	switch {
 	case errors.Is(err, sandbox.ErrCapacity):
 		s.writeSandboxError(w, r, err)

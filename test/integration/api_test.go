@@ -18,6 +18,7 @@ import (
 	"github.com/shusingh/roundhouse/internal/api"
 	"github.com/shusingh/roundhouse/internal/apiclient"
 	"github.com/shusingh/roundhouse/internal/config"
+	"github.com/shusingh/roundhouse/internal/node"
 	"github.com/shusingh/roundhouse/internal/sandbox"
 	"github.com/shusingh/roundhouse/internal/storage"
 	"github.com/shusingh/roundhouse/internal/vmm"
@@ -28,7 +29,6 @@ const testKey = "rh_integration_key"
 type stack struct {
 	client  *apiclient.Client
 	manager *sandbox.Manager
-	booter  *sandbox.FirecrackerBooter
 	layout  storage.Layout
 	cancel  context.CancelFunc
 }
@@ -44,20 +44,19 @@ func startStack(t *testing.T, extraYAML string) *stack {
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	layout := storage.Layout{Root: cfg.Host.DataDir}
-	booter := sandbox.NewFirecrackerBooter(sandbox.FirecrackerConfig{
-		Layout: layout, JailerPath: cfg.Host.JailerPath, FirecrackerPath: cfg.Host.FirecrackerPath,
-		CgroupRoot: cfg.Host.CgroupRoot, CgroupParent: cfg.Host.CgroupParent,
-		BootArgs: sandbox.DefaultBootArgs, VMMOverheadMiB: cfg.Host.VMMOverheadMiB, PidsMax: cfg.Sandbox.PidsMax,
-		BootTimeout: cfg.Sandbox.BootTimeout, ConsoleBytesPerSecond: 16 << 10,
-	}, logger)
-	manager := sandbox.NewManager(sandbox.Config{
-		MaxSandboxes: cfg.Sandbox.MaxSandboxes, UIDBase: cfg.Host.UIDBase, ReapInterval: cfg.Sandbox.ReapInterval,
-	}, booter, logger)
+	manager, err := node.New(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
 	apiServer, err := api.New(cfg, manager, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	if err := manager.Reconcile(ctx); err != nil {
+		cancel()
+		t.Fatalf("Reconcile: %v", err)
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -67,6 +66,13 @@ func startStack(t *testing.T, extraYAML string) *stack {
 	}()
 	srv := httptest.NewServer(apiServer.Handler())
 	t.Cleanup(func() {
+		if t.Failed() {
+			consoles, _ := filepath.Glob(filepath.Join(layout.JailBase(), "firecracker", "rh-sb-*", "root", "console.log"))
+			for _, c := range consoles {
+				data, _ := os.ReadFile(c)
+				t.Logf("console of %s (last 4 KiB):\n%s", filepath.Base(filepath.Dir(filepath.Dir(c))), tail(string(data), 4096))
+			}
+		}
 		srv.Close()
 		cancel()
 		<-done
@@ -77,7 +83,7 @@ func startStack(t *testing.T, extraYAML string) *stack {
 		}
 		assertHostClean(t, layout)
 	})
-	return &stack{client: apiclient.New(srv.URL, testKey), manager: manager, booter: booter, layout: layout, cancel: cancel}
+	return &stack{client: apiclient.New(srv.URL, testKey), manager: manager, layout: layout, cancel: cancel}
 }
 
 // assertHostClean fails if any Roundhouse jail, cgroup, VMM, or sandbox
@@ -210,5 +216,22 @@ func TestReconcileRemovesOrphans(t *testing.T) {
 	}
 	if exists(spec.Dir()) || exists(spec.CgroupDir()) || exists(layout.SandboxDir("sb-deadbeef0001")) {
 		t.Fatal("reconciliation left the orphan behind")
+	}
+}
+
+// TestLongSilentCommand covers a sandbox living past the guest's first ext4
+// journal commits, which write mid-disk: a file size limit below the scratch
+// disk's size once killed the VMM about five seconds after boot.
+func TestLongSilentCommand(t *testing.T) {
+	s := startStack(t, "")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	sb, err := s.client.Create(ctx, apiclient.CreateOptions{MemoryMiB: 256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, exit := execOut(t, ctx, s.client, sb.ID, "sh", "-c", "dd if=/dev/zero of=/root/f bs=1M count=16 2>/dev/null && sync && sleep 8 && echo done")
+	if out != "done\n" || exit.ExitCode != 0 {
+		t.Fatalf("long command printed %q, exit %+v", out, exit)
 	}
 }

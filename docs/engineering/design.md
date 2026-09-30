@@ -343,7 +343,10 @@ guest eth0 172.16.0.2 ── tap0 172.16.0.1 [netns rh-<id>] veth-g 10.200.x.2
   system with overlayfs, so the sandbox sees a normal writable root.
 - **Disk size limit** is the scratch image's size; a full disk fails writes in
   the guest and cannot grow the host file beyond its preallocated maximum.
-  The jailer's `fsize` limit caps any file Firecracker itself writes.
+  The jailer's `fsize` limit caps any file Firecracker itself writes. It
+  bounds write offsets, so it is sized to the larger of the scratch disk and
+  guest memory (a snapshot's memory file); below the disk size, the guest's
+  first mid-disk ext4 journal commit would kill the VMM with SIGXFSZ.
 - **Block I/O** is bounded with Firecracker's rate limiter on the virtio block
   device (bandwidth and operations per second).
 

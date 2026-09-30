@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/shusingh/roundhouse/internal/agentproto"
+	"github.com/shusingh/roundhouse/internal/netns"
 )
 
 // Errors callers branch on.
@@ -49,6 +50,7 @@ type BootSpec struct {
 	ID     string
 	Image  string
 	Limits Limits
+	Egress netns.Egress
 	// UID is the unprivileged host uid (and gid) the VMM runs as; unique among
 	// live sandboxes.
 	UID int
@@ -89,6 +91,7 @@ type CreateRequest struct {
 	Owner  string
 	Image  string
 	Limits Limits
+	Egress netns.Egress
 }
 
 // State is a sandbox's lifecycle state.
@@ -108,6 +111,7 @@ type Info struct {
 	Image       string
 	State       State
 	Limits      Limits
+	Egress      netns.Egress
 	CreatedAt   time.Time
 	ExpiresAt   time.Time
 	LastActive  time.Time
@@ -175,12 +179,20 @@ func randomID() string {
 	return "sb-" + hex.EncodeToString(b[:])
 }
 
-// Run reconciles leftovers from a previous run, then enforces deadlines until
-// ctx ends. Call Shutdown afterwards to destroy what remains.
-func (m *Manager) Run(ctx context.Context) error {
+// Reconcile removes host resources left by a previous run of the control
+// plane. It must finish before the first Create: it treats every Roundhouse
+// resource on the host as an orphan, including one a concurrent Create had
+// just made.
+func (m *Manager) Reconcile(ctx context.Context) error {
 	if err := m.booter.Reconcile(ctx); err != nil {
 		return fmt.Errorf("reconcile host state: %w", err)
 	}
+	return nil
+}
+
+// Run enforces deadlines until ctx ends. Call Reconcile before it, and
+// Shutdown after it to destroy what remains.
+func (m *Manager) Run(ctx context.Context) error {
 	ticker := time.NewTicker(m.cfg.ReapInterval)
 	defer ticker.Stop()
 	for {
@@ -198,9 +210,12 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (Info, error) {
 	if err := req.Limits.validate(); err != nil {
 		return Info{}, err
 	}
+	if err := req.Egress.Validate(); err != nil {
+		return Info{}, err
+	}
 	now := m.cfg.Now()
 	sb := &sandbox{info: Info{
-		ID: m.newID(), Owner: req.Owner, Image: req.Image, State: StateStarting, Limits: req.Limits,
+		ID: m.newID(), Owner: req.Owner, Image: req.Image, State: StateStarting, Limits: req.Limits, Egress: req.Egress,
 		CreatedAt: now, ExpiresAt: now.Add(req.Limits.Lifetime), LastActive: now,
 	}}
 
@@ -217,7 +232,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (Info, error) {
 	m.sandboxes[sb.info.ID] = sb
 	m.mu.Unlock()
 
-	vm, err := m.booter.Boot(ctx, BootSpec{ID: sb.info.ID, Image: req.Image, Limits: req.Limits, UID: sb.uid})
+	vm, err := m.booter.Boot(ctx, BootSpec{ID: sb.info.ID, Image: req.Image, Limits: req.Limits, Egress: req.Egress, UID: sb.uid})
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err != nil {

@@ -6,9 +6,12 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/shusingh/roundhouse/internal/agentproto"
 )
 
 // Guest layout. The root file system is the template's read-only image
@@ -52,6 +55,9 @@ func RunInit(logger *slog.Logger) error {
 	}
 	if err := loopbackUp(); err != nil {
 		return err
+	}
+	if err := writeResolvConf(); err != nil {
+		logger.Warn("write resolv.conf", slog.String("error", err.Error()))
 	}
 	superviseServer(logger)
 	return nil
@@ -135,6 +141,18 @@ func mountAfterPivot() error {
 		return fmt.Errorf("mount /dev/shm: %w", err)
 	}
 	return nil
+}
+
+// writeResolvConf points the guest at the public resolvers. The image's
+// /etc/resolv.conf is a symlink to systemd-resolved's stub, which does not run
+// in a sandbox, so it is replaced with a plain file.
+func writeResolvConf() error {
+	var b strings.Builder
+	for _, r := range agentproto.DNSResolvers {
+		b.WriteString("nameserver " + r + "\n")
+	}
+	_ = os.Remove("/etc/resolv.conf")
+	return os.WriteFile("/etc/resolv.conf", []byte(b.String()), 0o644) //nolint:gosec // G306: resolv.conf is world-readable by design
 }
 
 // loopbackUp brings up lo; many programs expect localhost to work.

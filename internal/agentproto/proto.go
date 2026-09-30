@@ -51,6 +51,11 @@ const (
 	MaxEntropyBytes = 4096
 )
 
+// DNSResolvers are the public resolvers a sandbox with egress uses. The host
+// firewall always allows DNS to them, and the agent writes them to the
+// guest's /etc/resolv.conf.
+var DNSResolvers = []string{"1.1.1.1", "8.8.8.8"}
+
 // ExecRequest runs one command in the guest.
 type ExecRequest struct {
 	// Argv is the program and its arguments; Argv[0] is resolved through PATH.

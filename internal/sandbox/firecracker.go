@@ -14,6 +14,7 @@ import (
 
 	"github.com/shusingh/roundhouse/internal/agentclient"
 	"github.com/shusingh/roundhouse/internal/agentproto"
+	"github.com/shusingh/roundhouse/internal/netns"
 	"github.com/shusingh/roundhouse/internal/storage"
 	"github.com/shusingh/roundhouse/internal/vmm"
 )
@@ -50,6 +51,11 @@ type FirecrackerConfig struct {
 	BootTimeout time.Duration
 	// ConsoleBytesPerSecond limits how fast a guest can write its console.
 	ConsoleBytesPerSecond int64
+	// Network creates each sandbox's namespace and egress rules.
+	Network *netns.Manager
+	// NetworkBytesPerSecond limits each direction of a sandbox's network
+	// device (Firecracker's rx and tx rate limiters).
+	NetworkBytesPerSecond int64
 }
 
 // DefaultBootArgs start the guest agent as init. The kernel adds the root
@@ -67,7 +73,9 @@ func NewFirecrackerBooter(cfg FirecrackerConfig, logger *slog.Logger) *Firecrack
 	return &FirecrackerBooter{cfg: cfg, logger: logger}
 }
 
-func (b *FirecrackerBooter) jailSpec(id string, uid int, limits Limits, files []vmm.JailFile) vmm.JailSpec {
+// jailSpec describes the jail for sandbox id. diskBytes is the size of the
+// largest disk image the VMM writes to.
+func (b *FirecrackerBooter) jailSpec(id string, uid int, limits Limits, diskBytes int64, files []vmm.JailFile) vmm.JailSpec {
 	mem := int64(limits.MemoryMiB+b.cfg.VMMOverheadMiB) << 20
 	return vmm.JailSpec{
 		ID:              jailPrefix + id,
@@ -81,9 +89,13 @@ func (b *FirecrackerBooter) jailSpec(id string, uid int, limits Limits, files []
 		MemoryMax:       mem,
 		CPUs:            float64(limits.VCPUs),
 		PidsMax:         b.cfg.PidsMax,
-		// Room for guest memory (a snapshot's memory file) plus the console.
-		FileSizeLimit: mem + 64<<20,
+		// RLIMIT_FSIZE bounds write offsets, not bytes written: the guest writes
+		// anywhere on its disk (the ext4 journal sits mid-disk), and a snapshot
+		// writes all of guest memory. Crossing the limit kills the VMM with
+		// SIGXFSZ, so it must cover the larger of the two, plus the console.
+		FileSizeLimit: max(mem, diskBytes) + 64<<20,
 		NoFileLimit:   1024,
+		NetNS:         netns.NamespacePath(id),
 		Files:         files,
 	}
 }
@@ -103,7 +115,7 @@ func (b *FirecrackerBooter) Boot(ctx context.Context, spec BootSpec) (_ VM, err 
 	if err != nil {
 		return nil, err
 	}
-	vm := &firecrackerVM{layout: b.cfg.Layout, id: spec.ID}
+	vm := &firecrackerVM{layout: b.cfg.Layout, network: b.cfg.Network, id: spec.ID}
 	defer func() {
 		if err != nil {
 			teardownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
@@ -112,7 +124,16 @@ func (b *FirecrackerBooter) Boot(ctx context.Context, spec BootSpec) (_ VM, err 
 		}
 	}()
 
-	jailSpec := b.jailSpec(spec.ID, spec.UID, spec.Limits, []vmm.JailFile{
+	// The namespace exists before the jailer joins it.
+	vm.hasNetwork = true
+	if err := b.cfg.Network.Create(ctx, spec.ID, spec.UID, spec.Egress); err != nil {
+		return nil, fmt.Errorf("create sandbox network: %w", err)
+	}
+	scratchInfo, err := os.Stat(scratch)
+	if err != nil {
+		return nil, fmt.Errorf("stat scratch disk: %w", err)
+	}
+	jailSpec := b.jailSpec(spec.ID, spec.UID, spec.Limits, scratchInfo.Size(), []vmm.JailFile{
 		{Source: img.Kernel, Name: jailKernel},
 		{Source: img.Rootfs, Name: jailRootfs},
 		{Source: scratch, Name: jailScratch, Writable: true},
@@ -151,7 +172,15 @@ func (b *FirecrackerBooter) configure(ctx context.Context, api *vmm.Client, limi
 			return api.PutMachineConfig(ctx, vmm.MachineConfig{VCPUCount: limits.VCPUs, MemSizeMiB: limits.MemoryMiB})
 		},
 		func() error {
-			return api.PutBootSource(ctx, vmm.BootSource{KernelImagePath: jailKernel, BootArgs: b.cfg.BootArgs})
+			args := b.cfg.BootArgs + " " + netns.GuestKernelArgs()
+			return api.PutBootSource(ctx, vmm.BootSource{KernelImagePath: jailKernel, BootArgs: args})
+		},
+		func() error {
+			limit := &vmm.RateLimiter{Bandwidth: &vmm.TokenBucket{Size: b.cfg.NetworkBytesPerSecond, RefillTimeMS: 1000}}
+			return api.PutNetworkInterface(ctx, vmm.NetworkInterface{
+				IfaceID: "eth0", HostDevName: netns.TapName, GuestMAC: netns.GuestMAC,
+				RxRateLimiter: limit, TxRateLimiter: limit,
+			})
 		},
 		func() error {
 			return api.PutDrive(ctx, vmm.Drive{DriveID: "rootfs", PathOnHost: jailRootfs, IsRootDevice: true, IsReadOnly: true})
@@ -217,13 +246,24 @@ func (b *FirecrackerBooter) Reconcile(ctx context.Context) error {
 				continue
 			}
 			seen[name] = true
-			spec := b.jailSpec(strings.TrimPrefix(name, jailPrefix), 1, Limits{VCPUs: 1, MemoryMiB: 128}, nil)
+			spec := b.jailSpec(strings.TrimPrefix(name, jailPrefix), 1, Limits{VCPUs: 1, MemoryMiB: 128}, 0, nil)
 			if err := vmm.DestroyJail(ctx, spec); err != nil {
 				errs = append(errs, err)
 				continue
 			}
 			b.logger.Warn("removed orphaned jail", slog.String("jail", name))
 		}
+	}
+	namespaces, err := netns.Namespaces()
+	if err != nil {
+		errs = append(errs, err)
+	}
+	// Nothing is live yet at startup, so every Roundhouse namespace is an orphan.
+	if err := b.cfg.Network.Reconcile(ctx, namespaces, nil); err != nil {
+		errs = append(errs, err)
+	}
+	if err := b.cfg.Network.Setup(ctx); err != nil {
+		errs = append(errs, err)
 	}
 	ids, err := b.cfg.Layout.SandboxIDs()
 	if err != nil {
@@ -242,11 +282,13 @@ func (b *FirecrackerBooter) Reconcile(ctx context.Context) error {
 // firecrackerVM is a booted sandbox. Its fields are set during Boot and not
 // changed afterwards.
 type firecrackerVM struct {
-	layout   storage.Layout
-	id       string
-	jailSpec *vmm.JailSpec
-	jail     *vmm.Jail
-	agent    *agentclient.Client
+	layout     storage.Layout
+	network    *netns.Manager
+	hasNetwork bool
+	id         string
+	jailSpec   *vmm.JailSpec
+	jail       *vmm.Jail
+	agent      *agentclient.Client
 }
 
 func (v *firecrackerVM) Exec(ctx context.Context, req agentproto.ExecRequest, onOutput func(*agentproto.Frame) error) (*agentproto.Frame, error) {
@@ -274,6 +316,12 @@ func (v *firecrackerVM) Destroy(ctx context.Context) error {
 	}
 	if v.jailSpec != nil {
 		if err := vmm.DestroyJail(ctx, *v.jailSpec); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	// The network goes after the VMM that uses it.
+	if v.hasNetwork {
+		if err := v.network.Destroy(ctx, v.id); err != nil {
 			errs = append(errs, err)
 		}
 	}

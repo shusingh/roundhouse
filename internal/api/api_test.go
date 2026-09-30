@@ -185,16 +185,24 @@ func TestCreateLimits(t *testing.T) {
 	var v sandboxView
 	_ = json.Unmarshal(resp.Body, &v)
 	got := fake.created[0]
+	if got.Egress.Mode != "none" {
+		t.Errorf("default egress = %q, want none", got.Egress.Mode)
+	}
 	if got.Owner != "alice" || got.Image != "default" || got.Limits.MemoryMiB != 1024 || got.Limits.VCPUs != 1 ||
 		got.Limits.Lifetime != time.Hour || v.ID != "sb-1" || v.MemoryMiB != 1024 {
 		t.Errorf("create request %+v, view %+v; want defaults except the requested memory", got, v)
 	}
 
 	for body, want := range map[string]string{
-		`{"memory_mib": 999999}`:    "invalid_limits",
-		`{"vcpus": -1}`:             "invalid_limits",
-		`{"lifetime_seconds": 1e9}`: "invalid_request",
-		`{"surprise": true}`:        "invalid_request",
+		`{"memory_mib": 999999}`:                                          "invalid_limits",
+		`{"vcpus": -1}`:                                                   "invalid_limits",
+		`{"lifetime_seconds": 1e9}`:                                       "invalid_request",
+		`{"surprise": true}`:                                              "invalid_request",
+		`{"egress": {"mode": "bridge"}}`:                                  "invalid_egress",
+		`{"egress": {"mode": "allowlist"}}`:                               "invalid_egress",
+		`{"egress": {"mode": "allowlist", "allow": ["10.0.0.1"]}}`:        "invalid_egress",
+		`{"egress": {"mode": "internet", "allow": ["203.0.113.1"]}}`:      "invalid_egress",
+		`{"egress": {"mode": "allowlist", "allow": ["169.254.169.254"]}}`: "invalid_egress",
 	} {
 		resp := call(t, srv, http.MethodPost, "/v1/sandboxes", aliceKey, strings.NewReader(body))
 		if resp.StatusCode != http.StatusBadRequest || errorCode(t, resp) != want {

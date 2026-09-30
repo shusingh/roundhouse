@@ -26,8 +26,7 @@ import (
 
 	"github.com/shusingh/roundhouse/internal/api"
 	"github.com/shusingh/roundhouse/internal/config"
-	"github.com/shusingh/roundhouse/internal/sandbox"
-	"github.com/shusingh/roundhouse/internal/storage"
+	"github.com/shusingh/roundhouse/internal/node"
 	"github.com/shusingh/roundhouse/internal/telemetry"
 )
 
@@ -67,23 +66,10 @@ func run() error {
 		return errors.New("must run as root: it launches jailed VMMs and manages cgroups and namespaces")
 	}
 
-	booter := sandbox.NewFirecrackerBooter(sandbox.FirecrackerConfig{
-		Layout:                storage.Layout{Root: cfg.Host.DataDir},
-		JailerPath:            cfg.Host.JailerPath,
-		FirecrackerPath:       cfg.Host.FirecrackerPath,
-		CgroupRoot:            cfg.Host.CgroupRoot,
-		CgroupParent:          cfg.Host.CgroupParent,
-		BootArgs:              sandbox.DefaultBootArgs,
-		VMMOverheadMiB:        cfg.Host.VMMOverheadMiB,
-		PidsMax:               cfg.Sandbox.PidsMax,
-		BootTimeout:           cfg.Sandbox.BootTimeout,
-		ConsoleBytesPerSecond: 16 << 10,
-	}, logger)
-	manager := sandbox.NewManager(sandbox.Config{
-		MaxSandboxes: cfg.Sandbox.MaxSandboxes,
-		UIDBase:      cfg.Host.UIDBase,
-		ReapInterval: cfg.Sandbox.ReapInterval,
-	}, booter, logger)
+	manager, err := node.New(cfg, logger)
+	if err != nil {
+		return err
+	}
 	apiServer, err := api.New(cfg, manager, logger)
 	if err != nil {
 		return err
@@ -92,7 +78,11 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 
-	// Reconcile before listening, so no request races a cleanup of leftovers.
+	// Reconcile before listening: it removes every Roundhouse resource on the
+	// host, so it must not overlap any request.
+	if err := manager.Reconcile(ctx); err != nil {
+		return err
+	}
 	managerErr := make(chan error, 1)
 	var wg sync.WaitGroup
 	wg.Go(func() { managerErr <- manager.Run(ctx) })
