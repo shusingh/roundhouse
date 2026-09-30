@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -47,6 +48,11 @@ func TestKillCgroupMissingIsNoop(t *testing.T) {
 
 func TestWaitCgroupEmpty(t *testing.T) {
 	t.Parallel()
+	if runtime.GOOS != "linux" {
+		// Windows fails an open that races the rename below; cgroups exist
+		// only on Linux anyway.
+		t.Skip("cgroup.events replacement is only race-free on Linux")
+	}
 	dir := t.TempDir()
 	events := filepath.Join(dir, "cgroup.events")
 	writeFile(t, events, "populated 1\n")
