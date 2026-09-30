@@ -96,14 +96,17 @@ func prepareRoot(spec JailSpec) error {
 func readPID(ctx context.Context, file string) (int, error) {
 	for {
 		data, err := os.ReadFile(file) //nolint:gosec // G304: path derived from a validated spec
-		if err == nil {
+		// The jailer creates the file before writing it, so an empty file means
+		// "not yet". It writes the PID in one small write, which a reader sees
+		// whole or not at all.
+		if err == nil && len(data) > 0 {
 			pid, convErr := strconv.Atoi(strings.TrimSpace(string(data)))
 			if convErr != nil || pid <= 0 {
 				return 0, fmt.Errorf("pid file %s: invalid contents %q", file, data)
 			}
 			return pid, nil
 		}
-		if !errors.Is(err, fs.ErrNotExist) {
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return 0, fmt.Errorf("read pid file: %w", err)
 		}
 		select {

@@ -112,3 +112,23 @@ func writeFile(t *testing.T, name, content string) {
 		t.Fatal(err)
 	}
 }
+
+func TestReadPIDWaitsForContents(t *testing.T) {
+	t.Parallel()
+	file := filepath.Join(t.TempDir(), "firecracker.pid")
+	// The jailer creates the file first and writes it a moment later.
+	writeFile(t, file, "")
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		_ = os.WriteFile(file, []byte("4242"), 0o600)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if pid, err := readPID(ctx, file); err != nil || pid != 4242 {
+		t.Fatalf("readPID = %d, %v; want 4242 once written", pid, err)
+	}
+	writeFile(t, file, "not-a-pid")
+	if _, err := readPID(ctx, file); err == nil {
+		t.Error("readPID accepted garbage")
+	}
+}
