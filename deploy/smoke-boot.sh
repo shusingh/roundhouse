@@ -43,13 +43,18 @@ fc_pid=$!
 for _ in $(seq 100); do [[ -S "$sock" ]] && break; sleep 0.01; done
 
 api PUT /machine-config '{"vcpu_count": 1, "mem_size_mib": 256}'
-api PUT /boot-source "{\"kernel_image_path\": \"$images/vmlinux\", \"boot_args\": \"console=ttyS0 reboot=k panic=1 pci=off quiet init=/bin/sh -- -c 'echo RH_USERSPACE_UP; exec sleep 3600'\"}"
+# The kernel command line understands double quotes only. The marker is
+# computed by the guest shell (RH_UP_42), so it cannot match the command line,
+# which the kernel prints if init fails.
+# shellcheck disable=SC2016 # the guest shell expands $((40+2)), not this one
+boot_args='console=ttyS0 reboot=k panic=1 pci=off quiet init=/bin/sh -- -c \"echo RH_UP_$((40+2)); exec sleep 3600\"'
+api PUT /boot-source "{\"kernel_image_path\": \"$images/vmlinux\", \"boot_args\": \"$boot_args\"}"
 api PUT /drives/rootfs "{\"drive_id\": \"rootfs\", \"path_on_host\": \"$work/rootfs.ext4\", \"is_root_device\": true, \"is_read_only\": false}"
 
 start=$(date +%s%N)
 api PUT /actions '{"action_type": "InstanceStart"}'
 for _ in $(seq 1000); do
-  if grep -q RH_USERSPACE_UP "$work/console.log"; then
+  if grep -q RH_UP_42 "$work/console.log"; then
     end=$(date +%s%N)
     echo "boot to user space: $(( (end - start) / 1000000 )) ms"
     exit 0
