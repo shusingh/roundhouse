@@ -5,6 +5,7 @@ package agent
 import (
 	"errors"
 	"os/exec"
+	"time"
 )
 
 // configureProcessGroup is a no-op off Linux: the agent only runs inside
@@ -12,5 +13,9 @@ import (
 func configureProcessGroup(*exec.Cmd) {}
 
 func reseedKernel([]byte) error {
+	return errors.ErrUnsupported
+}
+
+func setWallClock(time.Time) error {
 	return errors.ErrUnsupported
 }

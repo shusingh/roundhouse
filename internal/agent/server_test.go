@@ -301,10 +301,13 @@ func TestRestoreAndHealth(t *testing.T) {
 	t.Parallel()
 	s, srv := newTestServer(t)
 	var reseeded []byte
+	var clock time.Time
 	s.reseed = func(b []byte) error { reseeded = b; return nil }
+	s.setClock = func(t time.Time) error { clock = t; return nil }
 
 	entropy := bytes.Repeat([]byte{7}, 64)
-	body, _ := json.Marshal(agentproto.RestoreRequest{SandboxID: "sb-42", Entropy: entropy})
+	hostNow := time.Date(2026, 9, 29, 12, 0, 0, 123, time.UTC)
+	body, _ := json.Marshal(agentproto.RestoreRequest{SandboxID: "sb-42", Entropy: entropy, UnixNano: hostNow.UnixNano()})
 	resp, err := http.Post(srv.URL+agentproto.PathRestore, "application/json", bytes.NewReader(body)) //nolint:noctx // test
 	if err != nil {
 		t.Fatal(err)
@@ -312,6 +315,9 @@ func TestRestoreAndHealth(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent || !bytes.Equal(reseeded, entropy) {
 		t.Fatalf("restore status %d, reseeded %d bytes; want 204 and the entropy passed through", resp.StatusCode, len(reseeded))
+	}
+	if !clock.Equal(hostNow) {
+		t.Errorf("guest clock set to %v, want the host's %v", clock, hostNow)
 	}
 
 	resp, err = http.Get(srv.URL + agentproto.PathHealth) //nolint:noctx // test

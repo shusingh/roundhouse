@@ -139,6 +139,10 @@ type RestoreRequest struct {
 	// Entropy is fresh randomness from the host, mixed into the guest kernel's
 	// pool before a forced reseed.
 	Entropy []byte `json:"entropy"`
+	// UnixNano is the host's wall clock when it sent the request. The agent
+	// sets the guest's clock to it: a restored guest's clock otherwise reads
+	// the time its snapshot was taken. Zero leaves the clock alone.
+	UnixNano int64 `json:"unix_nano,omitempty"`
 }
 
 // Validate checks the request's bounds.
@@ -148,6 +152,9 @@ func (r *RestoreRequest) Validate() error {
 	}
 	if len(r.Entropy) < MinEntropyBytes || len(r.Entropy) > MaxEntropyBytes {
 		return fmt.Errorf("entropy: %d bytes, want %d to %d", len(r.Entropy), MinEntropyBytes, MaxEntropyBytes)
+	}
+	if r.UnixNano < 0 {
+		return errors.New("unix_nano: must not be negative")
 	}
 	return nil
 }

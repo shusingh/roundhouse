@@ -49,6 +49,8 @@ type Server struct {
 	start  time.Time
 	// reseed mixes host entropy into the guest kernel and forces a reseed.
 	reseed func([]byte) error
+	// setClock sets the guest's wall clock.
+	setClock func(time.Time) error
 
 	mu        sync.Mutex
 	sandboxID string // guarded by mu
@@ -57,7 +59,7 @@ type Server struct {
 
 // NewServer returns a server that logs with logger.
 func NewServer(logger *slog.Logger) *Server {
-	return &Server{logger: logger, start: time.Now(), reseed: reseedKernel}
+	return &Server{logger: logger, start: time.Now(), reseed: reseedKernel, setClock: setWallClock}
 }
 
 // Handler returns the HTTP handler for the agent protocol.
@@ -280,6 +282,12 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 	if err := req.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if req.UnixNano != 0 {
+		if err := s.setClock(time.Unix(0, req.UnixNano)); err != nil {
+			writeError(w, http.StatusInternalServerError, "set clock: "+err.Error())
+			return
+		}
 	}
 	if err := s.reseed(req.Entropy); err != nil {
 		writeError(w, http.StatusInternalServerError, "reseed: "+err.Error())

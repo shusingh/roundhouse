@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -18,6 +19,15 @@ func configureProcessGroup(cmd *exec.Cmd) {
 		// With Setpgid the group ID equals the leader's PID.
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
+}
+
+// setWallClock sets the guest's CLOCK_REALTIME.
+func setWallClock(t time.Time) error {
+	ts := unix.NsecToTimespec(t.UnixNano())
+	if err := unix.ClockSettime(unix.CLOCK_REALTIME, &ts); err != nil {
+		return fmt.Errorf("clock_settime: %w", err)
+	}
+	return nil
 }
 
 // rndReseedCRNG is the RNDRESEEDCRNG ioctl, _IO('R', 0x07): it makes the
